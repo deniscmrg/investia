@@ -1,0 +1,37 @@
+# Ambiente Python
+venv/
+.env
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+db.sqlite3
+
+# Django
+/staticfiles/
+/media/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node/React
+node_modules/
+dist/
+build/
+.cache/
+*.lock
+
+# Configuração local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
