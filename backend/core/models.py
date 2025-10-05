@@ -57,6 +57,39 @@ class Cotacao(models.Model):
         return f'{self.acao.ticker} {self.data} - {self.fechamento}'
 
 
+class RecomendacaoDiariaAtualNova(models.Model):
+    acao_id = models.IntegerField(primary_key=True)
+    ticker = models.CharField(max_length=20)
+    empresa = models.CharField(max_length=255)
+    setor = models.CharField(max_length=255, null=True, blank=True)
+    data = models.DateField()
+    preco_compra = models.DecimalField(max_digits=10, decimal_places=2)
+    alvo_sugerido = models.DecimalField(max_digits=10, decimal_places=2)
+    percentual_estimado = models.DecimalField(max_digits=6, decimal_places=2)
+    probabilidade = models.DecimalField(max_digits=6, decimal_places=2)
+    vezes_atingiu_alvo_1m = models.BigIntegerField(null=True, blank=True)
+    cruza_medias = models.BooleanField(null=True, blank=True)
+    obv_cres = models.BooleanField(null=True, blank=True)
+    vol_acima_media = models.BooleanField(null=True, blank=True)
+    wma602 = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    # campos com nomes que contêm espaços → usa db_column
+    MIN = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    MAX = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    ALTA = models.DecimalField(max_digits=29, decimal_places=2, null=True, blank=True)
+    BAIXA = models.DecimalField(max_digits=29, decimal_places=2, null=True, blank=True)
+    AMPLITUDE = models.DecimalField(max_digits=17, decimal_places=2, null=True, blank=True)
+    AMP_AxF = models.DecimalField(max_digits=21, decimal_places=2, null=True, blank=True, db_column="AMP A x F")
+    AMP_MXxMN = models.DecimalField(max_digits=17, decimal_places=2, null=True, blank=True, db_column="AMP MX x MN")
+    A_x_F = models.DecimalField(max_digits=21, decimal_places=2, null=True, blank=True, db_column="A x F")
+    ALVO = models.DecimalField(max_digits=21, decimal_places=2, null=True, blank=True, db_column="ALVO")
+
+    class Meta:
+        managed = False
+        db_table = "vw_recomendacoes_diarias_atual_nova"
+
+
+
 class RecomendacaoDiaria(models.Model):
     acao = models.ForeignKey('Acao', on_delete=models.CASCADE)
     data = models.DateField()  # data da recomendação

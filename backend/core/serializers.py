@@ -1,10 +1,8 @@
 from datetime import date
 from django.contrib.auth.models import User
 from rest_framework import serializers
-from .models import Cliente, Acao, OperacaoCarteira, Patrimonio, Custodia
+from .models import Cliente, Acao, OperacaoCarteira, Patrimonio, Custodia, RecomendacaoDiariaAtualNova
 from decimal import Decimal, InvalidOperation
-
-
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -174,5 +172,12 @@ class PatrimonioSerializer(serializers.ModelSerializer):
 class CustodiaSerializer(serializers.ModelSerializer):
     class Meta:
         model = Custodia
+        fields = "__all__"
+
+
+
+class RecomendacaoDiariaAtualNovaSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RecomendacaoDiariaAtualNova
         fields = "__all__"
 

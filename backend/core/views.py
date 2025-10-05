@@ -31,7 +31,7 @@ from .models import (
     Patrimonio,      # <<< tipado
     Custodia,
     Cotacao,
-    RecomendacaoDiariaAtual
+    RecomendacaoDiariaAtual, RecomendacaoDiariaAtualNova
 )
 from .serializers import (
     UserSerializer,
@@ -733,35 +733,77 @@ def patrimonio_disponivel(request):
         })
 
     return Response(saida)
+  
 
+# def recomendacoes_api(request):
+#     if request.method == "POST":
+#         ok, msg = _run_recomendacoes()
+#         status = "success" if ok else "error"
+#         return JsonResponse({"status": status, "message": msg})
 
+#     qs = RecomendacaoDiariaAtual.objects.all()
+#     dados = [
+#         {
+#             "ticker": r.ticker,
+#             "empresa": r.empresa,
+#             "setor": r.setor,
+#             "data": r.data,
+#             "preco_compra": float(r.preco_compra),
+#             "alvo_sugerido": float(r.alvo_sugerido),
+#             "percentual_estimado": float(r.percentual_estimado),
+#             "probabilidade": float(r.probabilidade),
+#             "vezes_atingiu_alvo_1m": r.vezes_atingiu_alvo_1m,
+#             "cruza_medias": r.cruza_medias,
+#             "obv_cres": r.obv_cres,
+#             "vol_acima_media": r.vol_acima_media,
+#             "wma602": r.wma602,
+#             "origem": r.origem,
+#         }
+#         for r in qs
+#     ]
+#     return JsonResponse(dados, safe=False)
 
-    
-
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
 def recomendacoes_api(request):
+    """
+    GET: retorna dados da vw_recomendacoes_diarias_atual_nova
+    POST: dispara a rotina _run_recomendacoes() (mantida igual)
+    """
     if request.method == "POST":
         ok, msg = _run_recomendacoes()
         status = "success" if ok else "error"
         return JsonResponse({"status": status, "message": msg})
 
-    qs = RecomendacaoDiariaAtual.objects.all()
+    qs = RecomendacaoDiariaAtualNova.objects.all().order_by("-data")
+
     dados = [
         {
+            "acao_id": r.acao_id,
             "ticker": r.ticker,
             "empresa": r.empresa,
             "setor": r.setor,
             "data": r.data,
-            "preco_compra": float(r.preco_compra),
-            "alvo_sugerido": float(r.alvo_sugerido),
-            "percentual_estimado": float(r.percentual_estimado),
-            "probabilidade": float(r.probabilidade),
+            "preco_compra": float(r.preco_compra or 0),
+            "alvo_sugerido": float(r.alvo_sugerido or 0),
+            "percentual_estimado": float(r.percentual_estimado or 0),
+            "probabilidade": float(r.probabilidade or 0),
             "vezes_atingiu_alvo_1m": r.vezes_atingiu_alvo_1m,
-            "cruza_medias": r.cruza_medias,
-            "obv_cres": r.obv_cres,
-            "vol_acima_media": r.vol_acima_media,
-            "wma602": r.wma602,
-            "origem": r.origem,
+            "cruza_medias": bool(r.cruza_medias),
+            "obv_cres": bool(r.obv_cres),
+            "vol_acima_media": bool(r.vol_acima_media),
+            "wma602": float(r.wma602 or 0),
+            "MIN": float(r.MIN or 0),
+            "MAX": float(r.MAX or 0),
+            "ALTA": float(r.ALTA or 0),
+            "BAIXA": float(r.BAIXA or 0),
+            "AMPLITUDE": float(r.AMPLITUDE or 0),
+            "AMP_AxF": float(r.AMP_AxF or 0),
+            "AMP_MXxMN": float(r.AMP_MXxMN or 0),
+            "A_x_F": float(r.A_x_F or 0),
+            "ALVO": float(r.ALVO or 0),
         }
         for r in qs
     ]
+
     return JsonResponse(dados, safe=False)

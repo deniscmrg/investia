@@ -12,6 +12,9 @@ import {
   TableSortLabel,
   CircularProgress,
   Modal,
+  TextField,
+  MenuItem,
+  Button,
 } from "@mui/material";
 import api from "../../services/api";
 
@@ -50,6 +53,7 @@ const formatCurrencyBRL = (v) =>
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       }).format(Number(v));
+
 const formatPercentBR = (v) =>
   v == null || isNaN(Number(v))
     ? "-"
@@ -65,7 +69,11 @@ export default function DashboardRV() {
   const [recs, setRecs] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  // sort state
+  // filtros
+  const [filtroCliente, setFiltroCliente] = useState("");
+  const [filtroAcao, setFiltroAcao] = useState("");
+
+  // sort
   const [order, setOrder] = useState("asc");
   const [orderBy, setOrderBy] = useState("cliente");
 
@@ -93,11 +101,8 @@ export default function DashboardRV() {
 
   useEffect(() => {
     fetchDashboard();
-    const interval = setInterval(fetchDashboard, 60000);
-    return () => clearInterval(interval);
   }, []);
 
-  // modal overlay de loading
   const LoadingModal = () => (
     <Modal open={loading}>
       <Box
@@ -113,6 +118,22 @@ export default function DashboardRV() {
       </Box>
     </Modal>
   );
+
+  // --- gera listas únicas de clientes e ações
+  const clientesUnicos = [...new Set(posicionadas.map((p) => p.cliente))];
+  const acoesUnicas = [...new Set(posicionadas.map((p) => p.acao))];
+
+  // --- aplica filtros
+  const posicionadasFiltradas = posicionadas.filter((op) => {
+    const matchCliente = filtroCliente ? op.cliente === filtroCliente : true;
+    const matchAcao = filtroAcao ? op.acao === filtroAcao : true;
+    return matchCliente && matchAcao;
+  });
+
+  const limparFiltros = () => {
+    setFiltroCliente("");
+    setFiltroAcao("");
+  };
 
   return (
     <Box sx={{ mt: 12, px: 4 }}>
@@ -130,60 +151,126 @@ export default function DashboardRV() {
         </Tabs>
       </Box>
 
-      {/* POSICIONADAS */}
+      {/* =================== POSICIONADAS =================== */}
       {tabIndex === 0 && (
-        <Table>
-          <TableHead>
-            <TableRow>
-              {[
-                { id: "cliente", label: "Cliente" },
-                { id: "acao", label: "Ação" },
-                { id: "data_compra", label: "Data Compra" },
-                { id: "preco_compra", label: "Preço Unitário" },
-                { id: "quantidade", label: "Quantidade" },
-                { id: "valor_total_compra", label: "Valor Total Compra" },
-                { id: "preco_atual", label: "Preço Atual" },
-                { id: "lucro_percentual", label: "Variação (%)" },
-                { id: "valor_alvo", label: "Valor Alvo" },
-                { id: "dias_posicionado", label: "Dias Posicionado" },
-              ].map((col) => (
-                <TableCell key={col.id}>
-                  <TableSortLabel
-                    active={orderBy === col.id}
-                    direction={orderBy === col.id ? order : "asc"}
-                    onClick={() => handleRequestSort(col.id)}
-                  >
-                    {col.label}
-                  </TableSortLabel>
-                </TableCell>
+        <>
+          {/* Filtros + Botão Atualizar */}
+          <Box
+            sx={{
+              display: "flex",
+              gap: 2,
+              mb: 2,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <TextField
+              select
+              label="Filtrar por Cliente"
+              value={filtroCliente}
+              onChange={(e) => setFiltroCliente(e.target.value)}
+              sx={{ minWidth: 220 }}
+            >
+              <MenuItem value="">Todos</MenuItem>
+              {clientesUnicos.map((cli) => (
+                <MenuItem key={cli} value={cli}>
+                  {cli}
+                </MenuItem>
               ))}
-            </TableRow>
-          </TableHead>
+            </TextField>
 
-          <TableBody>
-            {stableSort(posicionadas, getComparator(order, orderBy)).map((op) => (
-              <TableRow key={op.id}>
-                <TableCell>{op.cliente}</TableCell>
-                <TableCell>{op.acao}</TableCell>
-                <TableCell>{op.data_compra ?? "-"}</TableCell>
-                <TableCell>{formatCurrencyBRL(op.preco_compra)}</TableCell>
-                <TableCell>{op.quantidade ?? "-"}</TableCell>
-                <TableCell>{formatCurrencyBRL(op.valor_total_compra)}</TableCell>
-                <TableCell>{formatCurrencyBRL(op.preco_atual)}</TableCell>
-                <TableCell
-                  sx={{ color: (op.lucro_percentual ?? 0) >= 0 ? "green" : "red" }}
-                >
-                  {formatPercentBR(op.lucro_percentual)}
-                </TableCell>
-                <TableCell>{formatCurrencyBRL(op.valor_alvo)}</TableCell>
-                <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
+            <TextField
+              select
+              label="Filtrar por Ação"
+              value={filtroAcao}
+              onChange={(e) => setFiltroAcao(e.target.value)}
+              sx={{ minWidth: 220 }}
+            >
+              <MenuItem value="">Todas</MenuItem>
+              {acoesUnicas.map((a) => (
+                <MenuItem key={a} value={a}>
+                  {a}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            {(filtroCliente || filtroAcao) && (
+              <Button
+                variant="outlined"
+                color="secondary"
+                onClick={limparFiltros}
+              >
+                Limpar Filtros
+              </Button>
+            )}
+
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={fetchDashboard}
+              sx={{ ml: "auto" }}
+            >
+              🔄 Atualizar
+            </Button>
+          </Box>
+
+          <Table>
+            <TableHead>
+              <TableRow>
+                {[
+                  { id: "cliente", label: "Cliente" },
+                  { id: "acao", label: "Ação" },
+                  { id: "data_compra", label: "Data Compra" },
+                  { id: "preco_compra", label: "Preço Unitário" },
+                  { id: "quantidade", label: "Quantidade" },
+                  { id: "valor_total_compra", label: "Valor Total Compra" },
+                  { id: "preco_atual", label: "Preço Atual" },
+                  { id: "lucro_percentual", label: "Variação (%)" },
+                  { id: "valor_alvo", label: "Valor Alvo" },
+                  { id: "dias_posicionado", label: "Dias Posicionado" },
+                ].map((col) => (
+                  <TableCell key={col.id}>
+                    <TableSortLabel
+                      active={orderBy === col.id}
+                      direction={orderBy === col.id ? order : "asc"}
+                      onClick={() => handleRequestSort(col.id)}
+                    >
+                      {col.label}
+                    </TableSortLabel>
+                  </TableCell>
+                ))}
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHead>
+
+            <TableBody>
+              {stableSort(posicionadasFiltradas, getComparator(order, orderBy)).map(
+                (op) => (
+                  <TableRow key={op.id}>
+                    <TableCell>{op.cliente}</TableCell>
+                    <TableCell>{op.acao}</TableCell>
+                    <TableCell>{op.data_compra ?? "-"}</TableCell>
+                    <TableCell>{formatCurrencyBRL(op.preco_compra)}</TableCell>
+                    <TableCell>{op.quantidade ?? "-"}</TableCell>
+                    <TableCell>{formatCurrencyBRL(op.valor_total_compra)}</TableCell>
+                    <TableCell>{formatCurrencyBRL(op.preco_atual)}</TableCell>
+                    <TableCell
+                      sx={{
+                        color: (op.lucro_percentual ?? 0) >= 0 ? "green" : "red",
+                      }}
+                    >
+                      {formatPercentBR(op.lucro_percentual)}
+                    </TableCell>
+                    <TableCell>{formatCurrencyBRL(op.valor_alvo)}</TableCell>
+                    <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
+                  </TableRow>
+                )
+              )}
+            </TableBody>
+          </Table>
+        </>
       )}
 
-      {/* PATRIMÔNIO DISPONÍVEL */}
+      {/* =================== PATRIMÔNIO DISPONÍVEL =================== */}
       {tabIndex === 1 && (
         <Table>
           <TableHead>
@@ -209,90 +296,102 @@ export default function DashboardRV() {
         </Table>
       )}
 
-           {/* RECOMENDAÇÕES */}
-      {tabIndex === 2 && (
-        <Box>
-          <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
-            <button
-              onClick={async () => {
-                setLoading(true);
-                try {
-                  await api("recomendacoes/", { method: "POST" });
-                  const res = await api("recomendacoes/");
-                  setRecs(res || []);
-                } catch (err) {
-                  console.error("Erro ao atualizar recomendações:", err);
-                } finally {
-                  setLoading(false);
-                }
-              }}
-              style={{
-                background: "#007bff",
-                color: "#fff",
-                border: "none",
-                padding: "8px 16px",
-                borderRadius: "6px",
-                cursor: "pointer",
-              }}
-            >
-              🔄 Atualizar
-            </button>
-          </Box>
-
-          <Table>
-            <TableHead>
-              <TableRow>
-                {[
-                  "Ticker",
-                  "Empresa",
-                  "Setor",
-                  "Data",
-                  "Preço compra",
-                  "Alvo sugerido",
-                  "% Estimado",
-                  "Probabilidade",
-                  "Vezes alvo 1m",
-                  "Cruza médias",
-                  "OBV ↑",
-                  "Volume ↑",
-                  "WMA602",
-                  "Origem",
-                ].map((h, idx) => (
-                  <TableCell key={idx}>{h}</TableCell>
-                ))}
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {recs.length ? (
-                recs.map((r, i) => (
-                  <TableRow key={i}>
-                    <TableCell>{r.ticker}</TableCell>
-                    <TableCell>{r.empresa}</TableCell>
-                    <TableCell>{r.setor}</TableCell>
-                    <TableCell>{r.data}</TableCell>
-                    <TableCell>{formatCurrencyBRL(r.preco_compra)}</TableCell>
-                    <TableCell>{formatCurrencyBRL(r.alvo_sugerido)}</TableCell>
-                    <TableCell>{formatPercentBR(r.percentual_estimado)}</TableCell>
-                    <TableCell>{formatPercentBR(r.probabilidade)}</TableCell>
-                    <TableCell>{r.vezes_atingiu_alvo_1m}</TableCell>
-                    <TableCell>{r.cruza_medias ? "✅" : "❌"}</TableCell>
-                    <TableCell>{r.obv_cres ? "✅" : "❌"}</TableCell>
-                    <TableCell>{r.vol_acima_media ? "✅" : "❌"}</TableCell>
-                    <TableCell>{r.wma602 ? "✅" : "❌"}</TableCell>
-                    <TableCell>{r.origem}</TableCell>
-                  </TableRow>
-                ))
-              ) : (
-                <TableRow>
-                  <TableCell colSpan={14} align="center">
-                    Nenhuma recomendação encontrada.
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+      {/* =================== RECOMENDAÇÕES =================== */}
+     {tabIndex === 2 && (
+      <Box>
+        {/* Botão Atualizar */}
+        <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={async () => {
+              setLoading(true);
+              try {
+                await api("recomendacoes/", { method: "POST" });
+                const res = await api("recomendacoes/");
+                setRecs(res || []);
+              } catch (err) {
+                console.error("Erro ao atualizar recomendações:", err);
+              } finally {
+                setLoading(false);
+              }
+            }}
+          >
+            🔄 Atualizar
+          </Button>
         </Box>
-      )}
+
+        <Table>
+          <TableHead>
+            <TableRow>
+              {[
+                "Ticker",
+                "Empresa",
+                "Setor",
+                "Data",
+                "Preço compra",
+                "Alvo sugerido",
+                "% Estimado",
+                "Probabilidade",
+                "Vezes alvo 1m",
+                "Cruza médias",
+                "OBV ↑",
+                "Volume ↑",
+                "WMA602",
+                "MIN",
+                "MAX",
+                "AMPLITUDE",
+                "AMP A×F",
+                "AMP MX×MN",
+                "A×F",
+                "ALVO",
+                "ALTA",
+                "BAIXA",
+              ].map((h, idx) => (
+                <TableCell key={idx}>{h}</TableCell>
+              ))}
+            </TableRow>
+          </TableHead>
+
+          <TableBody>
+            {recs.length ? (
+              recs.map((r, i) => (
+                <TableRow key={i}>
+                  <TableCell>{r.ticker}</TableCell>
+                  <TableCell>{r.empresa}</TableCell>
+                  <TableCell>{r.setor}</TableCell>
+                  <TableCell>{r.data}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.preco_compra)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.alvo_sugerido)}</TableCell>
+                  <TableCell>{formatPercentBR(r.percentual_estimado)}</TableCell>
+                  <TableCell>{formatPercentBR(r.probabilidade)}</TableCell>
+                  <TableCell>{r.vezes_atingiu_alvo_1m}</TableCell>
+                  <TableCell>{r.cruza_medias ? "✅" : "❌"}</TableCell>
+                  <TableCell>{r.obv_cres ? "✅" : "❌"}</TableCell>
+                  <TableCell>{r.vol_acima_media ? "✅" : "❌"}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.wma602)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.MIN)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.MAX)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.AMPLITUDE)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.AMP_AxF)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.AMP_MXxMN)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.A_x_F)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.ALVO)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.ALTA)}</TableCell>
+                  <TableCell>{formatCurrencyBRL(r.BAIXA)}</TableCell>
+                </TableRow>
+              ))
+            ) : (
+              <TableRow>
+                <TableCell colSpan={22} align="center">
+                  Nenhuma recomendação encontrada.
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </Box>
+    )}
 
     </Box>
   );
