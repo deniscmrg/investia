@@ -51,6 +51,8 @@ class Cotacao(models.Model):
     atr = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
 
     class Meta:
+        db_table = "cotacoes_cotacao"  # nome correto da tabela
+        managed = False
         unique_together = ('acao', 'data')
 
     def __str__(self):
@@ -117,6 +119,8 @@ class RecomendacaoDiaria(models.Model):
     )
 
     class Meta:
+        db_table = "cotacoes_recomendacaodiaria"  # nome correto da tabela
+        managed = False
         unique_together = ('acao', 'data', 'origem')
 
     def __str__(self):

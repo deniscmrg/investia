@@ -10,7 +10,7 @@ from sklearn.metrics import classification_report
 
 # 🛠️ Inicializa Django corretamente
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend.settings")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
 django.setup()
 
 from cotacoes.models import Cotacao
