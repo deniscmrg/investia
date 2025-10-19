@@ -777,7 +777,15 @@ def clientes_mt5_status(request):
     timeout = getattr(settings, "MT5_CLIENT_API_TIMEOUT", 5)
     resultados = []
 
-    for cliente in Cliente.objects.all():
+    try:
+        clientes = Cliente.objects.all()
+    except Exception as exc:
+        return Response(
+            {"error": f"Falha ao carregar clientes: {exc}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    for cliente in clientes:
         ip_publico = (cliente.vm_ip or "").strip()
         ip_privado = (cliente.vm_private_ip or "").strip()
         ip_utilizado = ip_privado or ip_publico
@@ -805,8 +813,8 @@ def clientes_mt5_status(request):
                 except ValueError:
                     payload = None
 
-                status, detalhe = _evaluate_mt5_status(payload)
-                info["status"] = status
+                status_label, detalhe = _evaluate_mt5_status(payload)
+                info["status"] = status_label
                 info["detail"] = detalhe
 
                 if payload:
@@ -821,6 +829,9 @@ def clientes_mt5_status(request):
         except requests.RequestException as exc:
             info["status"] = "error"
             info["detail"] = str(exc)
+        except Exception as exc:
+            info["status"] = "error"
+            info["detail"] = f"Falha inesperada: {exc}"
 
         resultados.append(info)
 
