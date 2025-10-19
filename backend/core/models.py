@@ -187,6 +187,7 @@ class Cliente(models.Model):
     telefone = models.CharField(max_length=20, blank=True)
     vm = models.CharField(max_length=20, blank=True)
     vm_ip = models.CharField(max_length=20, blank=True)
+    vm_private_ip = models.CharField(max_length=45, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
     codigo_xp = models.CharField(max_length=30, blank=True, null=True)
     percentual_patrimonio = models.DecimalField(max_digits=5, decimal_places=2, default=0)
