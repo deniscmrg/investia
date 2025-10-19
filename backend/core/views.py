@@ -13,6 +13,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -22,6 +23,13 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 from datetime import date
+
+import subprocess
+import sys
+import os
+import requests
+
+from django.conf import settings
 
 from .models import (
     Cliente,
@@ -733,50 +741,126 @@ def patrimonio_disponivel(request):
         })
 
     return Response(saida)
-  
 
-# def recomendacoes_api(request):
-#     if request.method == "POST":
-#         ok, msg = _run_recomendacoes()
-#         status = "success" if ok else "error"
-#         return JsonResponse({"status": status, "message": msg})
 
-#     qs = RecomendacaoDiariaAtual.objects.all()
-#     dados = [
-#         {
-#             "ticker": r.ticker,
-#             "empresa": r.empresa,
-#             "setor": r.setor,
-#             "data": r.data,
-#             "preco_compra": float(r.preco_compra),
-#             "alvo_sugerido": float(r.alvo_sugerido),
-#             "percentual_estimado": float(r.percentual_estimado),
-#             "probabilidade": float(r.probabilidade),
-#             "vezes_atingiu_alvo_1m": r.vezes_atingiu_alvo_1m,
-#             "cruza_medias": r.cruza_medias,
-#             "obv_cres": r.obv_cres,
-#             "vol_acima_media": r.vol_acima_media,
-#             "wma602": r.wma602,
-#             "origem": r.origem,
-#         }
-#         for r in qs
-#     ]
-#     return JsonResponse(dados, safe=False)
+def _build_mt5_status_url(ip: str) -> str:
+    scheme = getattr(settings, "MT5_CLIENT_API_SCHEME", "http").rstrip(":/")
+    port = getattr(settings, "MT5_CLIENT_API_PORT", "")
+    path = getattr(settings, "MT5_CLIENT_API_STATUS_PATH", "/status")
+
+    base = f"{scheme}://{ip}"
+    if port:
+        base = f"{base}:{port}"
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    return f"{base}{path}"
+
+
+def _evaluate_mt5_status(payload: dict | None) -> tuple[str, str | None]:
+    if not payload:
+        return "error", "Resposta vazia"
+
+    terminal = payload.get("terminal") or {}
+    if not terminal.get("connected"):
+        return "offline", "Terminal MT5 desconectado"
+    if terminal.get("trade_allowed") is False:
+        return "warning", "Trade não permitido"
+
+    return "online", None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def clientes_mt5_status(request):
+    timeout = getattr(settings, "MT5_CLIENT_API_TIMEOUT", 5)
+    resultados = []
+
+    for cliente in Cliente.objects.all():
+        ip_publico = (cliente.vm_ip or "").strip()
+        ip_privado = (cliente.vm_private_ip or "").strip()
+        ip_utilizado = ip_privado or ip_publico
+
+        info = {
+            "id": cliente.id,
+            "nome": cliente.nome,
+            "ip": ip_utilizado or None,
+            "status": "missing_ip",
+            "detail": None,
+            "ping": None,
+            "checked_at": timezone.now().isoformat(),
+        }
+
+        if not ip_utilizado:
+            resultados.append(info)
+            continue
+
+        url = _build_mt5_status_url(ip_utilizado)
+        try:
+            resposta = requests.get(url, timeout=timeout)
+            if resposta.ok:
+                try:
+                    payload = resposta.json()
+                except ValueError:
+                    payload = None
+
+                status, detalhe = _evaluate_mt5_status(payload)
+                info["status"] = status
+                info["detail"] = detalhe
+
+                if payload:
+                    terminal = payload.get("terminal") or {}
+                    info["ping"] = terminal.get("ping")
+            else:
+                info["status"] = "error"
+                info["detail"] = f"HTTP {resposta.status_code}"
+        except requests.Timeout:
+            info["status"] = "timeout"
+            info["detail"] = "Tempo limite excedido"
+        except requests.RequestException as exc:
+            info["status"] = "error"
+            info["detail"] = str(exc)
+
+        resultados.append(info)
+
+    return Response(resultados)
+
+
+def _run_recomendacoes():
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script_path = os.path.join(base_dir, "core", "scripts", "A03Recomendcoes_intraday.py")
+
+        # executa o script com o mesmo Python do projeto
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode == 0:
+            return True, f"Rotina concluída com sucesso.\n{result.stdout}"
+        else:
+            return False, f"Erro na execução ({result.returncode}):\n{result.stderr}"
+    except Exception as e:
+        return False, f"Falha ao executar: {e}"  
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def recomendacoes_api(request):
     """
     GET: retorna dados da vw_recomendacoes_diarias_atual_nova
-    POST: dispara a rotina _run_recomendacoes() (mantida igual)
+    POST: dispara a rotina _run_recomendacoes()
     """
+    from .models import RecomendacaoDiariaAtual  # importa dentro pra evitar loop
     if request.method == "POST":
         ok, msg = _run_recomendacoes()
         status = "success" if ok else "error"
         return JsonResponse({"status": status, "message": msg})
 
-    qs = RecomendacaoDiariaAtualNova.objects.all().order_by("-data")
-
+    qs = RecomendacaoDiariaAtual.objects.all().order_by("-data")
     dados = [
         {
             "acao_id": r.acao_id,
@@ -793,17 +877,7 @@ def recomendacoes_api(request):
             "obv_cres": bool(r.obv_cres),
             "vol_acima_media": bool(r.vol_acima_media),
             "wma602": float(r.wma602 or 0),
-            "MIN": float(r.MIN or 0),
-            "MAX": float(r.MAX or 0),
-            "ALTA": float(r.ALTA or 0),
-            "BAIXA": float(r.BAIXA or 0),
-            "AMPLITUDE": float(r.AMPLITUDE or 0),
-            "AMP_AxF": float(r.AMP_AxF or 0),
-            "AMP_MXxMN": float(r.AMP_MXxMN or 0),
-            "A_x_F": float(r.A_x_F or 0),
-            "ALVO": float(r.ALVO or 0),
         }
         for r in qs
     ]
-
     return JsonResponse(dados, safe=False)

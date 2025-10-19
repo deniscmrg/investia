@@ -2,6 +2,7 @@ import { IconButton, Tooltip } from "@mui/material";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AccountBalanceWalletIcon from "@mui/icons-material/AccountBalanceWallet";
+import FiberManualRecordIcon from "@mui/icons-material/FiberManualRecord";
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -34,7 +35,47 @@ export default function Clientes() {
   const [codigoXP, setCodigoXP] = useState("");
   const [VM, setVM] = useState("");
   const [VMIP, setVMIP] = useState("");
+  const [VMPrivateIP, setVMPrivateIP] = useState("");
   const [percentualPatrimonio, setPercentualPatrimonio] = useState(""); // NOVO
+  const [mt5Status, setMt5Status] = useState({});
+
+  const statusLabels = {
+    online: "MT5 conectado",
+    warning: "MT5 responde, porém com restrições",
+    offline: "MT5 desconectado",
+    timeout: "Tempo limite excedido",
+    error: "Erro ao consultar MT5",
+    missing_ip: "IP não configurado",
+  };
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case "online":
+        return "#2e7d32"; // verde
+      case "warning":
+        return "#ed6c02"; // laranja
+      case "offline":
+      case "error":
+      case "timeout":
+        return "#d32f2f"; // vermelho
+      case "missing_ip":
+      default:
+        return "#9e9e9e"; // cinza
+    }
+  };
+
+  const getStatusTooltip = (item) => {
+    if (!item) {
+      return "Verificando MT5...";
+    }
+    const base = statusLabels[item.status] || "Status desconhecido";
+    const pingInfo =
+      item.ping !== null && item.ping !== undefined
+        ? ` • Ping: ${item.ping} ms`
+        : "";
+    const detail = item.detail ? ` • ${item.detail}` : "";
+    return `${base}${detail}${pingInfo}`;
+  };
 
   const fetchClientes = async () => {
     try {
@@ -46,8 +87,36 @@ export default function Clientes() {
     }
   };
 
+  const fetchMt5Status = async () => {
+    try {
+      const res = await api("clientes/mt5-status/");
+      if (Array.isArray(res)) {
+        const mapped = res.reduce((acc, item) => {
+          if (item && typeof item.id !== "undefined") {
+            acc[item.id] = item;
+          }
+          return acc;
+        }, {});
+        setMt5Status(mapped);
+      } else {
+        setMt5Status({});
+      }
+    } catch (err) {
+      console.error("Erro ao verificar status do MT5:", err);
+    }
+  };
+
   useEffect(() => {
     fetchClientes();
+  }, []);
+
+  useEffect(() => {
+    fetchMt5Status();
+    const intervalId = setInterval(() => {
+      fetchMt5Status();
+    }, 30 * 60 * 1000); // 30 minutos
+
+    return () => clearInterval(intervalId);
   }, []);
 
   const handleSave = async () => {
@@ -66,7 +135,7 @@ export default function Clientes() {
         percentualPatrimonio !== "" ? Number(percentualPatrimonio) : 0,
       vm: VM,
       vm_ip: VMIP,
-
+      vm_private_ip: VMPrivateIP,
     };
 
     if (editing) {
@@ -80,7 +149,8 @@ export default function Clientes() {
         body: JSON.stringify(data),
       });
     }
-    fetchClientes();
+    await fetchClientes();
+    await fetchMt5Status();
     handleClose();
   };
 
@@ -94,13 +164,15 @@ export default function Clientes() {
     setPercentualPatrimonio(cliente.percentual_patrimonio ?? "");
     setVM(cliente.vm);
     setVMIP(cliente.vm_ip);
+    setVMPrivateIP(cliente.vm_private_ip || "");
     setOpen(true);
   };
 
   const handleDelete = async (id) => {
     if (confirm("Deseja realmente deletar?")) {
       await api(`clientes/${id}/`, { method: "DELETE" });
-      fetchClientes();
+      await fetchClientes();
+      await fetchMt5Status();
     }
   };
 
@@ -114,6 +186,7 @@ export default function Clientes() {
     setCodigoXP("");
     setVM("");
     setVMIP("");
+    setVMPrivateIP("");
     setPercentualPatrimonio(""); // NOVO
   };
 
@@ -140,6 +213,8 @@ export default function Clientes() {
             <TableCell>% Patrimônio</TableCell>
             <TableCell>VM Nome</TableCell>
             <TableCell>VM IP</TableCell>
+            <TableCell>VM IP Privado</TableCell>
+            <TableCell>Status MT5</TableCell>
             <TableCell>Ações</TableCell>
           </TableRow>
         </TableHead>
@@ -158,6 +233,17 @@ export default function Clientes() {
               </TableCell>
               <TableCell>{c.vm}</TableCell>
               <TableCell>{c.vm_ip}</TableCell>
+              <TableCell>{c.vm_private_ip}</TableCell>
+              <TableCell>
+                <Tooltip title={getStatusTooltip(mt5Status[c.id])}>
+                  <span>
+                    <FiberManualRecordIcon
+                      sx={{ color: getStatusColor(mt5Status[c.id]?.status) }}
+                      fontSize="small"
+                    />
+                  </span>
+                </Tooltip>
+              </TableCell>
               <TableCell>
                 <Tooltip title="Editar">
                   <IconButton size="small" onClick={() => handleEdit(c)}>
@@ -262,6 +348,13 @@ export default function Clientes() {
             fullWidth
             value={VMIP}
             onChange={(e) => setVMIP(e.target.value)}
+            sx={{ mt: 1 }}
+          />
+          <TextField
+            label="VM IP Privado"
+            fullWidth
+            value={VMPrivateIP}
+            onChange={(e) => setVMPrivateIP(e.target.value)}
             sx={{ mt: 1 }}
           />
         </DialogContent>

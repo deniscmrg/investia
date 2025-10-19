@@ -4,7 +4,8 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from core.views import ( MyTokenObtainPairView, perfil_usuario, logout_view, ClienteViewSet, 
                         OperacaoCarteiraViewSet, AcaoViewSet, cotacoes_atuais, dashboard_rv, 
-                        ImportacaoUploadView, carteira_resumo, patrimonio_disponivel, recomendacoes_api)
+                        ImportacaoUploadView, carteira_resumo, patrimonio_disponivel, recomendacoes_api,
+                        clientes_mt5_status)
 
 
 # Router para CRUD de clientes
@@ -41,8 +42,10 @@ urlpatterns = [
     # API para listar o patrimônio de todos os clientes
     path("api/patrimonio-disponivel/", patrimonio_disponivel, name="patrimonio_disponivel"),
 
+    # Status MT5 dos clientes
+    path("api/clientes/mt5-status/", clientes_mt5_status, name="clientes_mt5_status"),
+
     # Para retornar as recomendações diárias
     path("api/recomendacoes/", recomendacoes_api, name="recomendacoes_api"),
 
 ]
-
