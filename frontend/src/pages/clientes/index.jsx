@@ -89,7 +89,7 @@ export default function Clientes() {
 
   const fetchMt5Status = async () => {
     try {
-      const res = await api("clientes/mt5-status/");
+      const res = await api("clientes-status/");
       if (Array.isArray(res)) {
         const mapped = res.reduce((acc, item) => {
           if (item && typeof item.id !== "undefined") {

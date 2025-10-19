@@ -43,7 +43,7 @@ urlpatterns = [
     path("api/patrimonio-disponivel/", patrimonio_disponivel, name="patrimonio_disponivel"),
 
     # Status MT5 dos clientes
-    path("api/clientes/mt5-status/", clientes_mt5_status, name="clientes_mt5_status"),
+    path("api/clientes-status/", clientes_mt5_status, name="clientes_mt5_status"),
 
     # Para retornar as recomendações diárias
     path("api/recomendacoes/", recomendacoes_api, name="recomendacoes_api"),
