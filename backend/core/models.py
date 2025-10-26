@@ -321,3 +321,110 @@ class Custodia(models.Model):
 
     def __str__(self):
         return f'{self.data_referencia} - {self.cod_cliente or "sem cliente"} - {self.ativo or "-"}'
+
+
+# =======================
+# MT5 Integração (managed)
+# =======================
+from uuid import uuid4
+
+
+class MT5Order(models.Model):
+    """Log e estado de uma ordem enviada ao MT5 (por cliente)."""
+    STATUS_CHOICES = (
+        ("enviada", "Enviada"),
+        ("pendente", "Pendente"),
+        ("parcial", "Parcial"),
+        ("executada", "Executada"),
+        ("cancelada", "Cancelada"),
+        ("rejeitada", "Rejeitada"),
+    )
+
+    id = models.BigAutoField(primary_key=True)
+    group_id = models.UUIDField(default=uuid4, editable=False, db_index=True)
+
+    cliente = models.ForeignKey(Cliente, on_delete=models.DO_NOTHING, db_constraint=False)
+
+    base_ticker = models.CharField(max_length=20)
+    symbol = models.CharField(max_length=20)
+    lado = models.CharField(max_length=10)  # 'compra' | 'venda'
+    execucao = models.CharField(max_length=10)  # 'mercado' | 'limite' | 'stop'
+
+    volume_req = models.DecimalField(max_digits=14, decimal_places=4)
+    price_req = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    tp_req = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    sl_req = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+
+    apply_tp_after_exec = models.BooleanField(default=False)
+
+    account_login = models.BigIntegerField(null=True, blank=True)
+    magic = models.IntegerField(null=True, blank=True)
+    comment = models.CharField(max_length=64, null=True, blank=True)
+
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="enviada")
+    order_ticket = models.BigIntegerField(null=True, blank=True, db_index=True)
+    request_id = models.CharField(max_length=64, null=True, blank=True)
+    retcode = models.IntegerField(null=True, blank=True)
+    response_json = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "mt5_order"
+        indexes = [
+            models.Index(fields=["cliente", "created_at"]),
+            models.Index(fields=["group_id", "status"]),
+        ]
+
+
+class MT5Deal(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    cliente = models.ForeignKey(Cliente, on_delete=models.DO_NOTHING, db_constraint=False)
+
+    order_ticket = models.BigIntegerField(null=True, blank=True, db_index=True)
+    deal_ticket = models.BigIntegerField(unique=True)
+    position_ticket = models.BigIntegerField(null=True, blank=True, db_index=True)
+
+    symbol = models.CharField(max_length=20)
+    lado = models.CharField(max_length=10)
+    volume = models.DecimalField(max_digits=14, decimal_places=4)
+    price = models.DecimalField(max_digits=14, decimal_places=6)
+    commission = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    swap = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    profit = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+
+    time = models.DateTimeField()
+    magic = models.IntegerField(null=True, blank=True)
+    comment = models.CharField(max_length=64, null=True, blank=True)
+    raw_json = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "mt5_deal"
+        indexes = [
+            models.Index(fields=["cliente", "time"]),
+            models.Index(fields=["order_ticket"]),
+            models.Index(fields=["position_ticket"]),
+        ]
+
+
+class OperacaoMT5Leg(models.Model):
+    """Detalhamento por símbolo/posição vinculado a OperacaoCarteira consolidada."""
+    id = models.BigAutoField(primary_key=True)
+    operacao = models.ForeignKey(OperacaoCarteira, on_delete=models.DO_NOTHING, db_constraint=False)
+    symbol = models.CharField(max_length=20)
+    position_ticket = models.BigIntegerField()
+    volume = models.DecimalField(max_digits=14, decimal_places=4)
+    price_open = models.DecimalField(max_digits=14, decimal_places=6)
+    order_ticket = models.BigIntegerField(null=True, blank=True)
+    deal_tickets = models.TextField(null=True, blank=True)  # JSON list
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "mt5_operacao_leg"
+        indexes = [
+            models.Index(fields=["operacao"]),
+            models.Index(fields=["symbol"]),
+        ]
