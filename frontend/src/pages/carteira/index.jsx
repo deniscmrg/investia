@@ -46,6 +46,16 @@ export default function Carteira() {
   const [compraStatus, setCompraStatus] = useState(null);
   const compraIntervalRef = useRef(null);
 
+  // ---------- MT5 Venda (modal) ----------
+  const [openVendaModal, setOpenVendaModal] = useState(false);
+  const [opParaVenda, setOpParaVenda] = useState(null);
+  const [execucaoVenda, setExecucaoVenda] = useState("mercado");
+  const [precoLimiteVenda, setPrecoLimiteVenda] = useState("");
+  const [vendendo, setVendendo] = useState(false);
+  const [vendaGroupId, setVendaGroupId] = useState(null);
+  const [vendaStatus, setVendaStatus] = useState(null);
+  const vendaIntervalRef = useRef(null);
+
   // form
   const [acao, setAcao] = useState("");
   const [dataCompra, setDataCompra] = useState("");
@@ -228,6 +238,56 @@ export default function Carteira() {
       } catch (err) {
         console.error("Erro ao deletar operação:", err);
       }
+    }
+  };
+
+  // ---------- Venda ----------
+  const abrirVenda = (op) => {
+    setOpParaVenda(op);
+    setExecucaoVenda("mercado");
+    setPrecoLimiteVenda("");
+    setVendaStatus(null);
+    setVendaGroupId(null);
+    setOpenVendaModal(true);
+  };
+
+  const confirmarVenda = async () => {
+    if (!opParaVenda) return;
+    setVendendo(true);
+    try {
+      const body = { execucao: execucaoVenda };
+      if (execucaoVenda === "limite") body.preco = Number(precoLimiteVenda);
+      const res = await api(`clientes/${id}/mt5/venda/${opParaVenda.id}/`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (res?.group_id) {
+        setVendaGroupId(res.group_id);
+        if (vendaIntervalRef.current) clearInterval(vendaIntervalRef.current);
+        vendaIntervalRef.current = setInterval(async () => {
+          try {
+            const st = await api(`clientes/${id}/mt5/venda-status/${res.group_id}/`);
+            setVendaStatus(st);
+            if (st?.executed_all) {
+              clearInterval(vendaIntervalRef.current);
+              vendaIntervalRef.current = null;
+              const opsRes = await api(`operacoes/?cliente=${id}`);
+              const lista = opsRes.results || opsRes || [];
+              setOperacoes(lista);
+              await fetchResumo();
+              setVendendo(false);
+              setOpenVendaModal(false);
+            }
+          } catch (e) {
+            console.error("Erro no polling de venda:", e);
+          }
+        }, 3000);
+      } else {
+        setVendendo(false);
+      }
+    } catch (e) {
+      console.error("Erro no envio de venda:", e);
+      setVendendo(false);
     }
   };
 
@@ -533,6 +593,13 @@ export default function Carteira() {
                         <DeleteIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
+                    {tabIndex === 1 && (
+                      <Tooltip title="Vender (MT5)">
+                        <Button size="small" variant="contained" color="warning" onClick={() => abrirVenda(op)} sx={{ ml: 1 }}>
+                          Vender
+                        </Button>
+                      </Tooltip>
+                    )}
                   </TableCell>
                 </TableRow>
               );
@@ -673,6 +740,38 @@ export default function Carteira() {
         <CircularProgress color="inherit" />
         <Typography sx={{ ml: 2 }}>Aguarde, carregando dados da carteira...</Typography>
       </Backdrop>
+
+      {/* Modal: Venda MT5 */}
+      <Dialog open={openVendaModal} onClose={() => setOpenVendaModal(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Vender — {opParaVenda?.acao_nome}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Quantidade total" value={opParaVenda?.quantidade ?? ""} InputProps={{ readOnly: true }} />
+            <TextField select label="Execução" value={execucaoVenda} onChange={(e) => setExecucaoVenda(e.target.value)}>
+              <MenuItem value="mercado">Mercado</MenuItem>
+              <MenuItem value="limite">Limite</MenuItem>
+            </TextField>
+            {execucaoVenda === "limite" && (
+              <TextField label="Preço Limite" type="number" value={precoLimiteVenda} onChange={(e) => setPrecoLimiteVenda(e.target.value)} />
+            )}
+
+            {vendaGroupId && (
+              <Box sx={{ mt: 1 }}>
+                <Typography variant="body2">Acompanhamento (grupo {vendaGroupId})</Typography>
+                {vendaStatus?.summary?.map((s, i) => (
+                  <Typography key={i} variant="caption">
+                    {s.symbol}: {s.executada ? `executada vol ${s.volume}` : `parcial vol ${s.volume_exec ?? 0}`}
+                  </Typography>
+                ))}
+              </Box>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenVendaModal(false)} disabled={vendendo}>Cancelar</Button>
+          <Button variant="contained" color="warning" onClick={confirmarVenda} disabled={vendendo}>Confirmar Venda</Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

@@ -1342,6 +1342,247 @@ def mt5_compra_status(request, cliente_id: int, group_id):
     })
 
 
+# =============================
+# Venda MT5 - enviar e monitorar
+# =============================
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mt5_venda(request, cliente_id: int, operacao_id: int):
+    """
+    Envia ordens de venda (mercado/limite) para encerrar 100% da operação indicada (inclui fracionárias).
+
+    Body:
+    { "execucao": "mercado"|"limite", "preco": 10.00? }
+    """
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    try:
+        operacao = OperacaoCarteira.objects.get(pk=operacao_id, cliente=cliente, data_venda__isnull=True)
+    except OperacaoCarteira.DoesNotExist:
+        return Response({"detail": "Operação não encontrada ou já encerrada"}, status=404)
+
+    ip = _get_cliente_ip(cliente)
+    if not ip:
+        return Response({"detail": "Cliente sem IP configurado"}, status=400)
+
+    body = request.data or {}
+    execucao = (body.get("execucao") or "mercado").lower()
+    preco = body.get("preco")
+    if execucao not in ("mercado", "limite"):
+        return Response({"detail": "Execução inválida"}, status=400)
+    if execucao == "limite" and preco is None:
+        return Response({"detail": "Preço é obrigatório para ordem a limite"}, status=400)
+
+    mt5 = MT5Client(ip)
+
+    # Buscar legs vinculadas; se inexistentes, usa posições por símbolo base/frac
+    base = operacao.acao.ticker
+    frac = f"{base}F"
+
+    legs = list(OperacaoMT5Leg.objects.filter(operacao=operacao))
+
+    pos_map = {}
+    pos_resp = mt5.posicoes()
+    if pos_resp.ok and isinstance(pos_resp.data, list):
+        for p in pos_resp.data:
+            if isinstance(p, dict) and p.get("symbol"):
+                pos_map[p.get("symbol")] = p
+
+    symbols_to_close = []
+    if legs:
+        # fecha os símbolos presentes nas legs ainda existentes/positivas
+        for leg in legs:
+            sym = leg.symbol
+            p = pos_map.get(sym)
+            if p and float(p.get("volume", 0) or 0) > 0:
+                symbols_to_close.append((sym, float(p.get("volume"))))
+    else:
+        # fallback por símbolo base/fracionário
+        for sym in (base, frac):
+            p = pos_map.get(sym)
+            if p and float(p.get("volume", 0) or 0) > 0:
+                symbols_to_close.append((sym, float(p.get("volume"))))
+
+    if not symbols_to_close:
+        return Response({"detail": "Nenhuma posição MT5 encontrada para encerrar"}, status=400)
+
+    # pega login da conta (best-effort)
+    acc = mt5.status()
+    account_login = None
+    try:
+        if acc.ok and isinstance(acc.data, dict):
+            account_login = (acc.data.get("conta") or {}).get("login")
+    except Exception:
+        account_login = None
+
+    group_id = uuid4()
+    results = []
+    for sym, vol in symbols_to_close:
+        payload = {
+            "ticker": sym,
+            "tipo": "venda",
+            "quantidade": float(vol),
+            "execucao": execucao,
+        }
+        if execucao == "limite":
+            payload["preco"] = float(preco)
+
+        r = mt5.enviar_ordem(payload)
+        response_json = r.data if r.ok else (r.data if r.data is not None else r.error)
+        try:
+            order_ticket = int((response_json or {}).get("order") or (response_json or {}).get("order_ticket") or 0)
+        except Exception:
+            order_ticket = None
+        try:
+            retcode = int((response_json or {}).get("retcode") or 0)
+        except Exception:
+            retcode = None
+
+        status_label = "enviada" if r.ok else "rejeitada"
+        MT5Order.objects.create(
+            group_id=group_id,
+            cliente=cliente,
+            base_ticker=base,
+            symbol=sym,
+            lado="venda",
+            execucao=execucao,
+            volume_req=vol,
+            price_req=preco if execucao == "limite" else None,
+            tp_req=None,
+            apply_tp_after_exec=False,
+            account_login=account_login,
+            order_ticket=order_ticket,
+            retcode=retcode,
+            response_json=str(response_json) if response_json is not None else None,
+            status=status_label,
+            comment=f"sell_op:{operacao.id}",
+        )
+
+        results.append({"symbol": sym, "order_ticket": order_ticket, "status": status_label})
+
+    return Response({"group_id": str(group_id), "results": results})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def mt5_venda_status(request, cliente_id: int, group_id):
+    """
+    Verifica status das ordens de venda de um group_id. Quando todas executadas, atualiza OperacaoCarteira
+    (data_venda, preco_venda_unitario, valor_total_venda).
+    """
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    ip = _get_cliente_ip(cliente)
+    if not ip:
+        return Response({"detail": "Cliente sem IP configurado"}, status=400)
+
+    orders = list(MT5Order.objects.filter(cliente=cliente, group_id=group_id))
+    if not orders:
+        return Response({"detail": "group_id desconhecido"}, status=404)
+
+    # tenta inferir operacao_id do comment (sell_op:<id>)
+    operacao_id = None
+    for o in orders:
+        c = (o.comment or "").strip()
+        if c.startswith("sell_op:"):
+            try:
+                operacao_id = int(c.split(":", 1)[1])
+                break
+            except Exception:
+                pass
+
+    try:
+        operacao = OperacaoCarteira.objects.get(pk=operacao_id, cliente=cliente)
+    except Exception:
+        operacao = None
+
+    mt5 = MT5Client(ip)
+
+    # busca deals por período abrangendo as ordens
+    agora = timezone.now()
+    inicio_epoch = int((min(o.created_at for o in orders) - timedelta(hours=1)).timestamp())
+    fim_epoch = int((agora + timedelta(minutes=5)).timestamp())
+
+    deals_resp = mt5.historico_deals(inicio=inicio_epoch, fim=fim_epoch)
+    deals_by_order = {}
+    if deals_resp.ok and isinstance(deals_resp.data, list):
+        for d in deals_resp.data:
+            try:
+                order_id = int(d.get("order")) if isinstance(d, dict) else None
+            except Exception:
+                order_id = None
+            if not order_id:
+                continue
+            deals_by_order.setdefault(order_id, []).append(d)
+
+    executed_all = True
+    summary = []
+    vwap_num_total = 0.0
+    vol_total_exec = 0.0
+    last_time = None
+
+    for o in orders:
+        o_status = o.status
+        order_deals = deals_by_order.get(int(o.order_ticket or 0), [])
+        vol_exec = 0.0
+        vwap_num = 0.0
+        for d in order_deals:
+            try:
+                vol = float(d.get("volume", 0))
+                price = float(d.get("price", 0))
+                vol_exec += vol
+                vwap_num += vol * price
+                ts = int(d.get("time"))
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if (last_time is None) or (dt > last_time):
+                    last_time = dt
+            except Exception:
+                pass
+
+        if vol_exec >= float(o.volume_req):
+            if o_status != "executada":
+                o.status = "executada"
+                o.save(update_fields=["status", "updated_at"])
+            avg = (vwap_num / vol_exec) if vol_exec > 0 else None
+            summary.append({"symbol": o.symbol, "executada": True, "volume": vol_exec, "preco_medio": avg})
+        else:
+            executed_all = False
+            if o_status != "pendente":
+                o.status = "pendente"
+                o.save(update_fields=["status", "updated_at"])
+            summary.append({"symbol": o.symbol, "executada": False, "volume_exec": vol_exec})
+
+        vwap_num_total += vwap_num
+        vol_total_exec += vol_exec
+
+    updated_operacao = None
+    if executed_all and operacao is not None:
+        from decimal import Decimal
+        vwap_total = (vwap_num_total / vol_total_exec) if vol_total_exec > 0 else 0.0
+        venda_data = (last_time.date() if last_time else timezone.now().date())
+        try:
+            operacao.preco_venda_unitario = Decimal(str(vwap_total)).quantize(Decimal("0.01"))
+            operacao.valor_total_venda = (operacao.preco_venda_unitario * Decimal(str(operacao.quantidade))).quantize(Decimal("0.01"))
+            operacao.data_venda = venda_data
+            operacao.save(update_fields=["preco_venda_unitario", "valor_total_venda", "data_venda"])
+            updated_operacao = operacao.id
+        except Exception:
+            pass
+
+    return Response({
+        "executed_all": executed_all,
+        "summary": summary,
+        "updated_operacao_id": updated_operacao,
+    })
+
+
 def _run_recomendacoes():
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

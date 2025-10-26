@@ -10,6 +10,8 @@ from core.views import ( MyTokenObtainPairView, perfil_usuario, logout_view, Cli
                         mt5_compra_validar,
                         mt5_compra,
                         mt5_compra_status,
+                        mt5_venda,
+                        mt5_venda_status,
                         )
 
 
@@ -60,5 +62,9 @@ urlpatterns = [
     path("api/clientes/<int:cliente_id>/mt5/compra/validar/", mt5_compra_validar, name="mt5_compra_validar"),
     path("api/clientes/<int:cliente_id>/mt5/compra/", mt5_compra, name="mt5_compra"),
     path("api/clientes/<int:cliente_id>/mt5/compra-status/<uuid:group_id>/", mt5_compra_status, name="mt5_compra_status"),
+
+    # Fluxo de venda MT5 (encerra 100% da operação)
+    path("api/clientes/<int:cliente_id>/mt5/venda/<int:operacao_id>/", mt5_venda, name="mt5_venda"),
+    path("api/clientes/<int:cliente_id>/mt5/venda-status/<uuid:group_id>/", mt5_venda_status, name="mt5_venda_status"),
 
 ]
