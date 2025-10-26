@@ -149,6 +149,33 @@ class AcaoViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 # -------------------
+# Cotações helpers (MT5 first, yfinance fallback)
+# -------------------
+
+def _mt5_preco_atual(ip: str | None, base_ticker: str) -> float | None:
+    """Consulta preço atual via MT5 API do cliente. Retorna last ou ask/bid."""
+    if not ip or not base_ticker:
+        return None
+    try:
+        mt5 = MT5Client(ip)
+        q = mt5.cotacao(base_ticker)
+        if q.ok and isinstance(q.data, dict):
+            # prioriza last; fallback ask; por fim bid
+            last = q.data.get("last")
+            ask = q.data.get("ask")
+            bid = q.data.get("bid")
+            if last is not None:
+                return float(last)
+            if ask is not None:
+                return float(ask)
+            if bid is not None:
+                return float(bid)
+    except Exception:
+        pass
+    return None
+
+
+# -------------------
 # Cotações (yfinance)
 # -------------------
 
@@ -191,15 +218,45 @@ def dashboard_rv(request):
     # Todas as operações em aberto
     posicoes = OperacaoCarteira.objects.filter(data_venda__isnull=True)
 
-    tickers = list(set([op.acao.ticker + ".SA" for op in posicoes]))
-    cotacoes = {}
-    if tickers:
-        data = yf.download(tickers=tickers, period="1d", interval="1d", progress=False)["Close"].iloc[-1]
-        cotacoes = data.to_dict() if hasattr(data, "to_dict") else {tickers[0]: float(data)}
+    # Tickers base e um IP MT5 associado (se existir) por ticker
+    ticker_ips = {}
+    for op in posicoes:
+        base = (op.acao.ticker or "").strip().upper()
+        if not base:
+            continue
+        if base in ticker_ips:
+            continue
+        # prefere IP privado quando configurado
+        ip_publico = (getattr(op.cliente, "vm_ip", "") or "").strip()
+        ip_privado = (getattr(op.cliente, "vm_private_ip", "") or "").strip()
+        ip = ip_privado or ip_publico or None
+        if ip:
+            ticker_ips[base] = ip
+
+    cotacoes: dict[str, float] = {}
+    # 1) MT5 por ticker base
+    for base, ip in ticker_ips.items():
+        preco = _mt5_preco_atual(ip, base)
+        if preco is not None:
+            cotacoes[f"{base}.SA"] = float(preco)
+
+    # 2) fallback yfinance para os que faltaram
+    tickers_all = list({(op.acao.ticker or '').strip().upper() + ".SA" for op in posicoes if op.acao and op.acao.ticker})
+    faltando = [t for t in tickers_all if t not in cotacoes]
+    if faltando:
+        try:
+            data = yf.download(tickers=faltando, period="1d", interval="1d", progress=False)["Close"].iloc[-1]
+            if hasattr(data, "to_dict"):
+                cotacoes.update({k: float(v) for k, v in data.to_dict().items()})
+            else:
+                # quando há apenas um ticker
+                cotacoes[faltando[0]] = float(data)
+        except Exception:
+            pass
 
     posicionadas = []
     for op in posicoes:
-        ticker = op.acao.ticker + ".SA"
+        ticker = (op.acao.ticker or '').strip().upper() + ".SA"
         preco_atual = cotacoes.get(ticker)
         dias_pos = (hoje - op.data_compra).days
 
@@ -457,25 +514,36 @@ def carteira_resumo(request, cliente_id):
 
     percentual = _to_decimal(getattr(cliente, "percentual_patrimonio", 0))
 
-    # -------- Posicionadas (yfinance) + POSICIONADO (CUSTO - VALOR_ATUAL) ----------
+    # -------- Posicionadas (MT5 com fallback yfinance) + POSICIONADO (CUSTO - VALOR_ATUAL) ----------
     posicionadas_valor_atual = Decimal("0")
     posicionadas_custo = Decimal("0")
     abertos = operacoes.filter(data_venda__isnull=True)
 
-    tickers = list({f"{op.acao.ticker}.SA" for op in abertos if getattr(op.acao, "ticker", None)})
-    cotacoes = {}
-    if tickers:
+    # tenta primeiro via MT5 do próprio cliente
+    cotacoes: dict[str, float] = {}
+    ip_cli = (getattr(cliente, "vm_private_ip", "") or getattr(cliente, "vm_ip", "") or "").strip() or None
+    bases = list({(op.acao.ticker or '').strip().upper() for op in abertos if getattr(op.acao, "ticker", None)})
+    if ip_cli and bases:
+        for base in bases:
+            preco = _mt5_preco_atual(ip_cli, base)
+            if preco is not None:
+                cotacoes[f"{base}.SA"] = float(preco)
+
+    # fallback yfinance
+    tickers = [f"{b}.SA" for b in bases]
+    faltando = [t for t in tickers if t not in cotacoes]
+    if faltando:
         try:
-            data = yf.download(tickers=tickers, period="1d", interval="1m", progress=False)
-            if len(tickers) == 1:
+            data = yf.download(tickers=faltando, period="1d", interval="1m", progress=False)
+            if len(faltando) == 1:
                 ultimo_close = data["Close"].dropna().iloc[-1]
-                cotacoes[tickers[0]] = float(ultimo_close)
+                cotacoes[faltando[0]] = float(ultimo_close)
             else:
-                for t in tickers:
-                    ultimo_close = data["Close"][t].dropna().iloc[-1]
+                for t in faltando:
+                    ultimo_close = (data["Close"][t] if hasattr(data["Close"], "__getitem__") else data["Close"]).dropna().iloc[-1]
                     cotacoes[t] = float(ultimo_close)
-        except Exception as e:
-            print("Erro yfinance:", e)
+        except Exception:
+            pass
 
     for op in abertos:
         t = f"{op.acao.ticker}.SA"
@@ -555,24 +623,32 @@ def carteira_detalhe(request, cliente_id):
     operacoes = OperacaoCarteira.objects.filter(cliente=cliente)
 
     # ======================
-    # 1. Buscar últimas cotações no yfinance
+    # 1. Buscar últimas cotações via MT5 (fallback yfinance)
     # ======================
     abertos = operacoes.filter(data_venda__isnull=True)
-    tickers = list({f"{op.acao.ticker}.SA" for op in abertos if op.acao and op.acao.ticker})
-
-    cotacoes = {}
-    if tickers:
+    bases = list({(op.acao.ticker or '').strip().upper() for op in abertos if op.acao and op.acao.ticker})
+    cotacoes: dict[str, float] = {}
+    ip_cli = (getattr(cliente, "vm_private_ip", "") or getattr(cliente, "vm_ip", "") or "").strip() or None
+    if ip_cli and bases:
+        for base in bases:
+            preco = _mt5_preco_atual(ip_cli, base)
+            if preco is not None:
+                cotacoes[f"{base}.SA"] = float(preco)
+    # fallback yfinance
+    tickers = [f"{b}.SA" for b in bases]
+    faltando = [t for t in tickers if t not in cotacoes]
+    if faltando:
         try:
-            data = yf.download(tickers=tickers, period="1d", interval="1m", progress=False)
-            if len(tickers) == 1:
-                ultimo = data["Close"].iloc[-1]
-                cotacoes[tickers[0]] = float(ultimo)
+            data = yf.download(tickers=faltando, period="1d", interval="1m", progress=False)
+            if len(faltando) == 1:
+                ultimo = data["Close"].dropna().iloc[-1]
+                cotacoes[faltando[0]] = float(ultimo)
             else:
-                for t in tickers:
-                    ultimo = data["Close"][t].dropna().iloc[-1]
+                for t in faltando:
+                    ultimo = (data["Close"][t] if hasattr(data["Close"], "__getitem__") else data["Close"]).dropna().iloc[-1]
                     cotacoes[t] = float(ultimo)
-        except Exception as e:
-            print("Erro ao buscar yfinance:", e)
+        except Exception:
+            pass
 
     # Enriquecer operações com preço atual
     operacoes_data = []
