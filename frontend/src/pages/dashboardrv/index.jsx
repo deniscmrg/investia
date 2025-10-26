@@ -272,7 +272,6 @@ export default function DashboardRV() {
 
       {/* =================== PATRIMÔNIO DISPONÍVEL =================== */}
       {tabIndex === 1 && (
-        <Box sx={{ '& .MuiTableCell-root': { fontSize: '0.79rem' } }}>
         <Table>
           <TableHead>
             <TableRow>
@@ -322,6 +321,7 @@ export default function DashboardRV() {
           </Button>
         </Box>
 
+        <Box sx={{ '& .MuiTableCell-root': { fontSize: '0.79rem' } }}>
         <Table>
           <TableHead>
             <TableRow>
