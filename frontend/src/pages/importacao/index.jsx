@@ -4,8 +4,7 @@ import api from "../../services/api";
 
 export default function Importacao() {
   const [dataRef, setDataRef] = useState("");
-  const [filePatrimonio, setFilePatrimonio] = useState(null);
-  const [fileCustodia, setFileCustodia] = useState(null);
+  const [fileAll, setFileAll] = useState(null);
   const [confirma, setConfirma] = useState({ aberto: false, tipo: "", formData: null });
   const [msg, setMsg] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -20,7 +19,15 @@ export default function Importacao() {
     try {
       setLoading(true);
       const res = await api("importacao/upload/", { method: "POST", body: form });
-      setMsg({ severity: "success", text: `Importado ${tipo} (${res.linhas} linhas) [${res.status}]` });
+      // Resposta pode ser por tipo único (linhas/status) ou auto (resumo por tipo)
+      if (res?.resumo) {
+        const p = res.resumo.patrimonio ? `Patrimônio: ${res.resumo.patrimonio.linhas} [${res.resumo.patrimonio.status}]` : null;
+        const c = res.resumo.custodia ? `Custódia: ${res.resumo.custodia.linhas} [${res.resumo.custodia.status}]` : null;
+        const parts = [p, c].filter(Boolean).join(" | ");
+        setMsg({ severity: "success", text: `Importado (auto) — ${parts}` });
+      } else {
+        setMsg({ severity: "success", text: `Importado ${tipo} (${res.linhas} linhas) [${res.status}]` });
+      }
     } catch (err) {
       // Se vier 409, precisamos confirmar
       if (String(err).includes("Erro 409")) {
@@ -39,12 +46,11 @@ export default function Importacao() {
       setMsg({ severity: "warning", text: "Informe a data de referência." });
       return;
     }
-    if (!filePatrimonio && !fileCustodia) {
-      setMsg({ severity: "warning", text: "Selecione ao menos um arquivo (Patrimônio e/ou Custódia)." });
+    if (!fileAll) {
+      setMsg({ severity: "warning", text: "Selecione o arquivo (com abas de Patrimônio e Custódia)." });
       return;
     }
-    if (filePatrimonio) await enviar("patrimonio", filePatrimonio);
-    if (fileCustodia)  await enviar("custodia", fileCustodia);
+    await enviar("auto", fileAll);
   };
 
   const confirmarSobrescrita = async () => {
@@ -53,7 +59,14 @@ export default function Importacao() {
       const form = confirma.formData;
       form.set("force", "true");
       const res = await api("importacao/upload/", { method: "POST", body: form });
-      setMsg({ severity: "success", text: `Sobrescrito ${confirma.tipo} (${res.linhas} linhas).` });
+      if (res?.resumo) {
+        const p = res.resumo.patrimonio ? `Patrimônio: ${res.resumo.patrimonio.linhas} [${res.resumo.patrimonio.status}]` : null;
+        const c = res.resumo.custodia ? `Custódia: ${res.resumo.custodia.linhas} [${res.resumo.custodia.status}]` : null;
+        const parts = [p, c].filter(Boolean).join(" | ");
+        setMsg({ severity: "success", text: `Sobrescrito (auto) — ${parts}` });
+      } else {
+        setMsg({ severity: "success", text: `Sobrescrito ${confirma.tipo} (${res.linhas} linhas).` });
+      }
     } catch (err) {
       setMsg({ severity: "error", text: `Falha ao sobrescrever ${confirma.tipo}. ${err}` });
     } finally {
@@ -84,18 +97,10 @@ export default function Importacao() {
           <Grid item xs={12} md={9} />
 
           <Grid item xs={12} md={6}>
-            <Typography variant="subtitle1" gutterBottom>Patrimônio (XLSX)</Typography>
+            <Typography variant="subtitle1" gutterBottom>Arquivo (Patrimônio + Custódia) — XLSX</Typography>
             <Button component="label" variant="outlined" fullWidth disabled={loading}>
-              {filePatrimonio ? filePatrimonio.name : "Selecionar arquivo..."}
-              <input hidden type="file" accept=".xlsx,.xls" onChange={(e) => setFilePatrimonio(e.target.files?.[0] || null)} />
-            </Button>
-          </Grid>
-
-          <Grid item xs={12} md={6}>
-            <Typography variant="subtitle1" gutterBottom>Custódia (XLSX)</Typography>
-            <Button component="label" variant="outlined" fullWidth disabled={loading}>
-              {fileCustodia ? fileCustodia.name : "Selecionar arquivo..."}
-              <input hidden type="file" accept=".xlsx,.xls" onChange={(e) => setFileCustodia(e.target.files?.[0] || null)} />
+              {fileAll ? fileAll.name : "Selecionar arquivo..."}
+              <input hidden type="file" accept=".xlsx,.xls" onChange={(e) => setFileAll(e.target.files?.[0] || null)} />
             </Button>
           </Grid>
 
@@ -110,7 +115,11 @@ export default function Importacao() {
       <Dialog open={confirma.aberto} onClose={() => setConfirma({ aberto: false, tipo: "", formData: null })}>
         <DialogTitle>Dados já existem</DialogTitle>
         <DialogContent>
-          Já existem dados de <b>{confirma.tipo}</b> para a data informada. Deseja sobrescrever?
+          {confirma.tipo === 'auto' ? (
+            <>Já existem dados para a data informada (Patrimônio e/ou Custódia). Deseja sobrescrever?</>
+          ) : (
+            <>Já existem dados de <b>{confirma.tipo}</b> para a data informada. Deseja sobrescrever?</>
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setConfirma({ aberto: false, tipo: "", formData: null })}>Cancelar</Button>

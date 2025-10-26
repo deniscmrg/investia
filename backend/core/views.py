@@ -304,7 +304,10 @@ def _to_number(val):
         return None
 
 def _xlsx_to_rows(file_bytes: bytes):
-    """Converte Excel em lista de dicts (cabeçalho = primeira linha não vazia)."""
+    """Converte Excel em lista de dicts (cabeçalho = primeira linha não vazia) usando a primeira aba.
+
+    Mantido para compatibilidade. Para múltiplas abas, usar _xlsx_to_sheets.
+    """
     try:
         import pandas as pd
         df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
@@ -332,6 +335,52 @@ def _xlsx_to_rows(file_bytes: bytes):
                 item[key] = val
             out.append(item)
         return out
+
+
+def _xlsx_to_sheets(file_bytes: bytes) -> dict:
+    """Lê todas as abas do Excel e retorna {nome_aba: [rows como dict]}.
+
+    - Usa pandas.read_excel(sheet_name=None) quando disponível.
+    - Fallback com openpyxl para iterar worksheets.
+    """
+    sheets = {}
+    try:
+        import pandas as pd
+        dfs = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl", sheet_name=None)
+        for name, df in dfs.items():
+            if df is None:
+                continue
+            df = df.dropna(how='all').dropna(axis=1, how='all')
+            if df.empty:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            sheets[str(name).strip()] = df.fillna('').to_dict(orient='records')
+        return sheets
+    except Exception:
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+            for ws in wb.worksheets:
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    continue
+                header_idx = next((i for i, r in enumerate(rows) if any(c not in (None, '') for c in r)), 0)
+                headers = [str(h).strip() if h is not None else '' for h in rows[header_idx]]
+                out = []
+                for r in rows[header_idx + 1:]:
+                    if r is None or all(v in (None, '') for v in r):
+                        continue
+                    item = {}
+                    for i, h in enumerate(headers):
+                        key = h or f'col_{i+1}'
+                        val = '' if i >= len(r) or r[i] in (None, '') else r[i]
+                        item[key] = val
+                    out.append(item)
+                if out:
+                    sheets[str(ws.title).strip()] = out
+        except Exception:
+            pass
+        return sheets
 
 def _norm_key(k: str) -> str:
     return str(k or '').strip().lower()
@@ -388,32 +437,153 @@ def _map_row(row: dict, tipo: str) -> dict:
     return out
 
 
+def _infer_tipo(sheet_name: str, rows: list[dict]) -> str | None:
+    """Tenta inferir o tipo da aba: 'patrimonio' | 'custodia' | None."""
+    name = _norm_key(sheet_name)
+    if 'patrim' in name:
+        return 'patrimonio'
+    if 'custod' in name:
+        return 'custodia'
+
+    if not rows:
+        return None
+    # usa os headers da primeira linha para heurística
+    headers = set(_norm_key(k) for k in rows[0].keys())
+    p_matches = len(headers.intersection(set(HEADER_MAP_PATRIMONIO.keys())))
+    c_matches = len(headers.intersection(set(HEADER_MAP_CUSTODIA.keys())))
+    if p_matches == 0 and c_matches == 0:
+        return None
+    return 'patrimonio' if p_matches >= c_matches else 'custodia'
+
+
 class ImportacaoUploadView(APIView):
     """
     POST multipart/form-data:
-        tipo: 'patrimonio' | 'custodia'
+        tipo: 'patrimonio' | 'custodia' | 'auto' (auto = lê todas as abas e importa ambas)
         data_referencia: 'YYYY-MM-DD'
         arquivo: <xlsx>
         force: 'true' (opcional) → apaga a data e recarrega
     Regras:
       - Se já existir dados na data e não vier force, retorna 409 (confirmação).
-      - Se force=true, apaga aquela data e insere os novos.
+      - Se force=true, apaga aquela data e insere os novos (por tipo detectado).
     """
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        tipo = request.data.get('tipo')
+        tipo = (request.data.get('tipo') or '').strip().lower() or 'auto'
         data_ref = request.data.get('data_referencia')
         force = str(request.data.get('force', 'false')).lower() == 'true'
         arq = request.FILES.get('arquivo')
 
-        if tipo not in ('patrimonio', 'custodia'):
-            return Response({'detail': "Parâmetro 'tipo' inválido."}, status=400)
+        if tipo not in ('patrimonio', 'custodia', 'auto'):
+            return Response({'detail': "Parâmetro 'tipo' inválido. Use 'patrimonio', 'custodia' ou 'auto'."}, status=400)
         if not data_ref:
             return Response({'detail': "Parâmetro 'data_referencia' é obrigatório (YYYY-MM-DD)."}, status=400)
         if not arq:
             return Response({'detail': "Arquivo não enviado (campo 'arquivo')."}, status=400)
+
+        file_bytes = arq.read()
+
+        # Modo AUTO: lê todas as abas e separa por tipo automaticamente
+        if tipo == 'auto':
+            sheets = _xlsx_to_sheets(file_bytes)
+            if not sheets:
+                return Response({'detail': 'Arquivo sem abas válidas.'}, status=400)
+
+            registros_por_tipo: dict[str, list[dict]] = {'patrimonio': [], 'custodia': []}
+            for sheet_name, linhas in sheets.items():
+                detected = _infer_tipo(sheet_name, linhas)
+                if detected not in ('patrimonio', 'custodia'):
+                    continue
+                for r in linhas:
+                    m = _map_row(r, detected)
+                    if m:
+                        m['data_referencia'] = data_ref
+                        registros_por_tipo[detected].append(m)
+
+            # remove vazios
+            registros_por_tipo = {k: v for k, v in registros_por_tipo.items() if v}
+            if not registros_por_tipo:
+                return Response({'detail': 'Nenhum registro válido encontrado nas abas.'}, status=400)
+
+            # Checagem de existência por tipo
+            conflitos = []
+            if 'patrimonio' in registros_por_tipo and Patrimonio.objects.filter(data_referencia=data_ref).exists():
+                conflitos.append('patrimonio')
+            if 'custodia' in registros_por_tipo and Custodia.objects.filter(data_referencia=data_ref).exists():
+                conflitos.append('custodia')
+
+            if conflitos and not force:
+                return Response(
+                    {
+                        'detail': f"Já há dados para esta data: {', '.join(conflitos)}. Confirma sobrescrita?",
+                        'need_confirm': True,
+                        'tipos_existentes': conflitos,
+                    },
+                    status=409
+                )
+
+            resumo = {}
+            with transaction.atomic():
+                # Patrimônio
+                if 'patrimonio' in registros_por_tipo:
+                    status_job = 'ok'
+                    if force and Patrimonio.objects.filter(data_referencia=data_ref).exists():
+                        Patrimonio.objects.filter(data_referencia=data_ref).delete()
+                        status_job = 'sobrescrito'
+                    objs = [Patrimonio(**m) for m in registros_por_tipo['patrimonio']]
+                    Patrimonio.objects.bulk_create(objs, batch_size=1000)
+                    ImportacaoJob.objects.create(
+                        tipo='patrimonio',
+                        data_referencia=data_ref,
+                        total_linhas=len(objs),
+                        status=status_job
+                    )
+                    resumo['patrimonio'] = {'linhas': len(objs), 'status': status_job}
+
+                # Custódia
+                if 'custodia' in registros_por_tipo:
+                    status_job = 'ok'
+                    if force and Custodia.objects.filter(data_referencia=data_ref).exists():
+                        Custodia.objects.filter(data_referencia=data_ref).delete()
+                        status_job = 'sobrescrito'
+                    objs = [Custodia(**m) for m in registros_por_tipo['custodia']]
+                    Custodia.objects.bulk_create(objs, batch_size=1000)
+                    ImportacaoJob.objects.create(
+                        tipo='custodia',
+                        data_referencia=data_ref,
+                        total_linhas=len(objs),
+                        status=status_job
+                    )
+                    resumo['custodia'] = {'linhas': len(objs), 'status': status_job}
+
+            return Response({'ok': True, 'data': data_ref, 'resumo': resumo})
+
+        # Modo tradicional: apenas um tipo explícito, mas agora escolhe a(s) aba(s) correspondente(s)
+        sheets = _xlsx_to_sheets(file_bytes)
+        registros = []
+        if sheets:
+            for sheet_name, linhas in sheets.items():
+                detected = _infer_tipo(sheet_name, linhas)
+                if detected != tipo:
+                    continue
+                for r in linhas:
+                    m = _map_row(r, tipo)
+                    if m:
+                        m['data_referencia'] = data_ref
+                        registros.append(m)
+        else:
+            # fallback para leitura simples (primeira aba)
+            linhas = _xlsx_to_rows(file_bytes)
+            for r in linhas:
+                m = _map_row(r, tipo)
+                if m:
+                    m['data_referencia'] = data_ref
+                    registros.append(m)
+
+        if not registros:
+            return Response({'detail': 'Nenhum registro válido encontrado no arquivo para o tipo informado.'}, status=400)
 
         Modelo = Patrimonio if tipo == 'patrimonio' else Custodia
         ja_existe = Modelo.objects.filter(data_referencia=data_ref).exists()
@@ -424,24 +594,12 @@ class ImportacaoUploadView(APIView):
                 status=409
             )
 
-        linhas = _xlsx_to_rows(arq.read())
-        registros = []
-        for r in linhas:
-            m = _map_row(r, tipo)
-            if m:
-                m['data_referencia'] = data_ref
-                registros.append(m)
-
-        if not registros:
-            return Response({'detail': 'Nenhum registro válido encontrado no arquivo.'}, status=400)
-
         with transaction.atomic():
             status_job = 'ok'
             if ja_existe and force:
                 Modelo.objects.filter(data_referencia=data_ref).delete()
                 status_job = 'sobrescrito'
 
-            # bulk_create
             if tipo == 'patrimonio':
                 objs = [Patrimonio(**m) for m in registros]
                 Patrimonio.objects.bulk_create(objs, batch_size=1000)
