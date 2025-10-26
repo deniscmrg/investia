@@ -45,6 +45,7 @@ export default function Recomendacoes() {
       <Button variant="contained" onClick={atualizar} sx={{ mb: 2 }}>🔄 Atualizar</Button>
       {msg && <Typography sx={{ mb: 2 }}>{msg}</Typography>}
       {loading ? <CircularProgress /> : (
+        <Box sx={{ '& .MuiTableCell-root': { fontSize: '0.79rem' } }}>
         <Table>
           <TableHead>
             <TableRow>
@@ -107,6 +108,7 @@ export default function Recomendacoes() {
             )}
           </TableBody>
         </Table>
+        </Box>
       )}
     </Box>
   );

@@ -42,7 +42,8 @@ def gerar_recomendacoes(top_n=30):
         volume__gt=0
     ).values(
         'data', 'acao__ticker', 'fechamento', 'atr', 'wma602', 'wma17', 'wma34',
-        'obv', 'rsi_14', 'volume', 'media_volume_20d', 'fechamento_anterior'
+        'obv', 'rsi_14', 'volume', 'media_volume_20d', 'fechamento_anterior',
+        'maxima', 'minima'
     )
 
     df = pd.DataFrame.from_records(qs)
@@ -56,8 +57,27 @@ def gerar_recomendacoes(top_n=30):
     ]
     df[campos_float] = df[campos_float].astype(float)
 
+    # ordena por ticker/data para cálculos de janelas
     df.sort_values(by=['acao__ticker', 'data'], inplace=True)
+
+    # OBV 5d defasado
     df['obv_5d'] = df.groupby('acao__ticker')['obv'].shift(5)
+
+    # RSI médio 4 meses (~80 pregões)
+    df['rsi_4m'] = df.groupby('acao__ticker')['rsi_14'].transform(
+        lambda x: x.rolling(80, min_periods=1).mean()
+    )
+
+    # Faixas de 4 meses: máximas e mínimas para cap de resistência
+    df['max_4m'] = df.groupby('acao__ticker')['maxima'].transform(
+        lambda x: x.rolling(80, min_periods=1).max()
+    )
+    df['min_4m'] = df.groupby('acao__ticker')['minima'].transform(
+        lambda x: x.rolling(80, min_periods=1).min()
+    )
+    df['amplitude_4m'] = (df['max_4m'] - df['min_4m']).astype(float)
+
+    # mantém apenas a data mais recente para cada ticker
     df = df[df['data'] == ultima_data].copy()
     df['obv_5d'] = df['obv_5d'].astype(float)
 
@@ -83,26 +103,41 @@ def gerar_recomendacoes(top_n=30):
     df.dropna(subset=['preco_atual'], inplace=True)
     df['preco_compra'] = df['preco_atual'].astype(float)
 
-    # Recalcular indicadores
+    # Recalcular indicadores de entrada (mantendo estrutura existente)
     df['fechamento_div_wma602'] = df['preco_compra'] / df['wma602']
     df['wma17_div_wma34'] = df['wma17'] / df['wma34']
     df['obv_ratio'] = df['obv'] / df['obv_5d']
     df['volume_ratio'] = df['volume'] / df['media_volume_20d']
     df['candlestick'] = df['preco_compra'] / df['fechamento_anterior']
 
-    # RSI médio 4 meses (~80 pregões)
-    df['rsi_4m'] = df.groupby('acao__ticker')['rsi_14'].transform(lambda x: x.rolling(80, min_periods=1).mean())
+    # Potencial usando ATR direto (D1/14) como base
+    df['potencial_alta'] = df['atr'] / df['preco_compra']
 
-    # ATR médio 3 meses e limitando outliers
-    df['atr_3m'] = df.groupby('acao__ticker')['atr'].transform(lambda x: x.rolling(60, min_periods=1).mean())
-    limite_atr = df['atr_3m'].quantile(0.95)
-    df['atr_ajustada'] = df['atr_3m'].clip(upper=limite_atr)
-    df['potencial_alta'] = df['atr_ajustada'] / df['preco_compra']
+    # Alvo unificado: k_base * ATR * f_RSI, com cap por resistência de 4m
+    # f_RSI dentro de [0.85, 1.25]
+    df['fator_rsi'] = ((70 - df['rsi_4m']) / 70).clip(lower=0.85, upper=1.25)
 
-    # Ajuste do alvo pelo RSI dos últimos 4 meses
-    df['fator_rsi'] = (70 - df['rsi_4m']) / 70
-    df['fator_rsi'] = df['fator_rsi'].clip(lower=0.5, upper=1.5)
-    df['valor_alvo'] = df['preco_compra'] + (df['atr_ajustada'] * df['fator_rsi'])
+    # parâmetros
+    k_base_default = 1.3
+    c1_default = 0.5
+
+    # posição no range de 4m
+    df['pos_range'] = (df['preco_compra'] - df['min_4m']) / df['amplitude_4m']
+
+    # k_base e c1 ajustados por esticamento
+    df['k_base'] = k_base_default
+    df.loc[df['pos_range'] > 0.85, 'k_base'] = k_base_default * 0.85
+    df['c1'] = np.where(df['pos_range'] > 0.85, 1.0, c1_default)
+
+    # alvo bruto e cap por resistência
+    df['target_raw'] = df['preco_compra'] * 1.0 + (df['k_base'] * df['atr'] * df['fator_rsi'])
+    df['cap_resistance'] = df['max_4m'] - (df['c1'] * df['atr'])
+    # aplica cap apenas quando válido e acima do preço de entrada
+    df['valor_alvo'] = np.where(
+        (df['cap_resistance'].notna()) & (df['cap_resistance'] > df['preco_compra']),
+        np.minimum(df['target_raw'], df['cap_resistance']),
+        df['target_raw']
+    )
 
     df.dropna(subset=[
         'fechamento_div_wma602', 'wma17_div_wma34', 'obv_ratio',
@@ -148,7 +183,7 @@ def gerar_recomendacoes(top_n=30):
     }).sort_values(by='probabilidade (%)', ascending=False).head(top_n)
 
     # Impressão
-    print("\n📈 Recomendações com base no modelo (entrada = intraday, alvo = ATR ajustado por RSI 4m):\n")
+    print("\n📈 Recomendações com base no modelo (entrada = intraday, alvo = k×ATR×f_RSI, cap em MAX_4m):\n")
     print(f"{'Ticker':<8} {'Compra':>8} {'Prob. (%)':>11} {'Faixa':>8} {'Lucro (%)':>11} {'Alvo':>10}")
     print("-" * 60)
     for _, row in resultado.iterrows():

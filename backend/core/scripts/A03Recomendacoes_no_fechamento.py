@@ -38,7 +38,8 @@ def gerar_recomendacoes(top_n=20):
         volume__gt=0
     ).values(
         'data', 'acao__ticker', 'fechamento', 'atr', 'wma602', 'wma17', 'wma34',
-        'obv', 'rsi_14', 'volume', 'media_volume_20d', 'fechamento_anterior'
+        'obv', 'rsi_14', 'volume', 'media_volume_20d', 'fechamento_anterior',
+        'maxima', 'minima'
     )
 
     df = pd.DataFrame.from_records(qs)
@@ -48,6 +49,20 @@ def gerar_recomendacoes(top_n=20):
 
     df.sort_values(by=['acao__ticker', 'data'], inplace=True)
     df['obv_5d'] = df.groupby('acao__ticker')['obv'].shift(5)
+
+    # RSI 4 meses (~80 pregões)
+    df['rsi_4m'] = df.groupby('acao__ticker')['rsi_14'].transform(
+        lambda x: x.rolling(80, min_periods=1).mean()
+    )
+    # Faixa 4m para cap de resistência
+    df['max_4m'] = df.groupby('acao__ticker')['maxima'].transform(
+        lambda x: x.rolling(80, min_periods=1).max()
+    )
+    df['min_4m'] = df.groupby('acao__ticker')['minima'].transform(
+        lambda x: x.rolling(80, min_periods=1).min()
+    )
+    df['amplitude_4m'] = (df['max_4m'] - df['min_4m']).astype(float)
+
     df = df[df['data'] == ultima_data].copy()
 
     for col in ['wma34', 'wma602', 'media_volume_20d', 'fechamento_anterior', 'obv_5d', 'atr']:
@@ -81,7 +96,24 @@ def gerar_recomendacoes(top_n=20):
     ]]
 
     df['probabilidade'] = modelo.predict_proba(X_pred)[:, 1]
-    df['valor_alvo'] = df['fechamento'] + df['atr']
+
+    # Alvo: k_base * ATR * f_RSI, com cap pelo MAX_4m
+    df['fator_rsi'] = ((70 - df['rsi_4m']) / 70).clip(lower=0.85, upper=1.25)
+    k_base_default = 1.3
+    c1_default = 0.5
+    df['pos_range'] = (df['fechamento'] - df['min_4m']) / df['amplitude_4m']
+    df['k_base'] = k_base_default
+    df.loc[df['pos_range'] > 0.85, 'k_base'] = k_base_default * 0.85
+    df['c1'] = np.where(df['pos_range'] > 0.85, 1.0, c1_default)
+
+    df['target_raw'] = df['fechamento'] + (df['k_base'] * df['atr'] * df['fator_rsi'])
+    df['cap_resistance'] = df['max_4m'] - (df['c1'] * df['atr'])
+    df['valor_alvo'] = np.where(
+        (df['cap_resistance'].notna()) & (df['cap_resistance'] > df['fechamento']),
+        np.minimum(df['target_raw'], df['cap_resistance']),
+        df['target_raw']
+    )
+
     df['lucro_perc'] = ((df['valor_alvo'] / df['fechamento']) - 1) * 100
     df['probabilidade_pct'] = (df['probabilidade'] * 100).round(2)
 
@@ -104,7 +136,7 @@ def gerar_recomendacoes(top_n=20):
     }).sort_values(by='probabilidade (%)', ascending=False).head(top_n)
 
     # Impressão formatada
-    print("\n📈 Recomendações com base no modelo (alvo = 1×ATR):\n")
+    print("\n📈 Recomendações com base no modelo (alvo = k×ATR×f_RSI, cap em MAX_4m):\n")
     print(f"{'Ticker':<8} {'Compra':>8} {'Prob. (%)':>11} {'Faixa':>8} {'Lucro (%)':>11} {'Alvo':>10}")
     print("-" * 60)
     for _, row in resultado.iterrows():
