@@ -5,7 +5,12 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from core.views import ( MyTokenObtainPairView, perfil_usuario, logout_view, ClienteViewSet, 
                         OperacaoCarteiraViewSet, AcaoViewSet, cotacoes_atuais, dashboard_rv, 
                         ImportacaoUploadView, carteira_resumo, patrimonio_disponivel, recomendacoes_api,
-                        clientes_mt5_status)
+                        clientes_mt5_status,
+                        recomendacoes_disponiveis,
+                        mt5_compra_validar,
+                        mt5_compra,
+                        mt5_compra_status,
+                        )
 
 
 # Router para CRUD de clientes
@@ -47,5 +52,13 @@ urlpatterns = [
 
     # Para retornar as recomendações diárias
     path("api/recomendacoes/", recomendacoes_api, name="recomendacoes_api"),
+
+    # Recomendações disponíveis para um cliente (sem posição aberta)
+    path("api/clientes/<int:cliente_id>/recomendacoes-disponiveis/", recomendacoes_disponiveis, name="recomendacoes_disponiveis"),
+
+    # Fluxo de compra MT5
+    path("api/clientes/<int:cliente_id>/mt5/compra/validar/", mt5_compra_validar, name="mt5_compra_validar"),
+    path("api/clientes/<int:cliente_id>/mt5/compra/", mt5_compra, name="mt5_compra"),
+    path("api/clientes/<int:cliente_id>/mt5/compra-status/<uuid:group_id>/", mt5_compra_status, name="mt5_compra_status"),
 
 ]

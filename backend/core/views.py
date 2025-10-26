@@ -39,7 +39,8 @@ from .models import (
     Patrimonio,      # <<< tipado
     Custodia,
     Cotacao,
-    RecomendacaoDiariaAtual, RecomendacaoDiariaAtualNova
+    RecomendacaoDiariaAtual, RecomendacaoDiariaAtualNova,
+    MT5Order, MT5Deal, OperacaoMT5Leg,
 )
 from .serializers import (
     UserSerializer,
@@ -47,6 +48,11 @@ from .serializers import (
     OperacaoCarteiraSerializer,
     AcaoSerializer,
 )
+from .mt5_client import MT5Client
+from uuid import uuid4
+from datetime import datetime, timedelta
+from django.utils.dateparse import parse_datetime
+
 
 
 # -------------------
@@ -836,6 +842,504 @@ def clientes_mt5_status(request):
         resultados.append(info)
 
     return Response(resultados)
+
+
+# =============================
+# Recomendações disponíveis
+# =============================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def recomendacoes_disponiveis(request, cliente_id: int):
+    try:
+        Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    # ações em aberto do cliente
+    abertos = OperacaoCarteira.objects.filter(cliente_id=cliente_id, data_venda__isnull=True).values_list("acao_id", flat=True)
+    qs = RecomendacaoDiariaAtualNova.objects.exclude(acao_id__in=list(abertos)).order_by("-probabilidade", "-percentual_estimado", "-data")
+    dados = [
+        {
+            "acao_id": r.acao_id,
+            "ticker": r.ticker,
+            "empresa": r.empresa,
+            "preco_compra": float(r.preco_compra or 0),
+            "alvo_sugerido": float(r.alvo_sugerido or 0),
+            "percentual_estimado": float(r.percentual_estimado or 0),
+            "probabilidade": float(r.probabilidade or 0),
+        }
+        for r in qs
+    ]
+    return Response(dados)
+
+
+# =============================
+# Compra MT5 - validação e envio
+# =============================
+
+def _get_cliente_ip(cliente: Cliente) -> str | None:
+    ip_publico = (cliente.vm_ip or "").strip()
+    ip_privado = (cliente.vm_private_ip or "").strip()
+    return ip_privado or ip_publico or None
+
+
+def _base_from_symbol(symbol: str) -> str:
+    return symbol[:-1] if symbol and symbol.endswith("F") else symbol
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mt5_compra_validar(request, cliente_id: int):
+    """
+    Valida compra e sugere distribuição fracionária quando necessário.
+
+    Body:
+    {
+      "ticker": "PETR4",              # base
+      "modo": "quantidade"|"valor",
+      "quantidade": 150,               # quando modo=quantidade
+      "valor": 1000.00,                # quando modo=valor
+      "execucao": "mercado"|"limite",
+      "preco": 36.20,                  # quando execucao=limite
+      "tp": 37.50
+    }
+    """
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    ip = _get_cliente_ip(cliente)
+    if not ip:
+        return Response({"detail": "Cliente sem IP configurado"}, status=400)
+
+    body = request.data or {}
+    ticker_base = str(body.get("ticker") or "").strip().upper()
+    modo = (body.get("modo") or "quantidade").lower()
+    quantidade = body.get("quantidade")
+    valor = body.get("valor")
+    execucao = (body.get("execucao") or "mercado").lower()
+    preco = body.get("preco")
+    tp = body.get("tp")
+
+    if not ticker_base:
+        return Response({"detail": "Parâmetro 'ticker' é obrigatório"}, status=400)
+    if modo not in ("quantidade", "valor"):
+        return Response({"detail": "Modo inválido"}, status=400)
+    if execucao not in ("mercado", "limite"):
+        return Response({"detail": "Execução inválida"}, status=400)
+    if execucao == "limite" and preco is None:
+        return Response({"detail": "Preço é obrigatório para ordem a limite"}, status=400)
+    if tp is None:
+        return Response({"detail": "TP (alvo) é obrigatório"}, status=400)
+
+    mt5 = MT5Client(ip)
+    base_info = mt5.simbolo(ticker_base)
+    frac_ticker = f"{ticker_base}F"
+    frac_info = mt5.simbolo(frac_ticker)
+
+    if not base_info.ok:
+        return Response({"detail": f"Símbolo base inválido: {ticker_base}"}, status=400)
+
+    # preço de referência para cálculo por valor
+    ref_price = None
+    if execucao == "mercado":
+        q = mt5.cotacao(ticker_base)
+        if q.ok and isinstance(q.data, dict):
+            ref_price = float(q.data.get("ask") or q.data.get("last") or 0) or None
+    else:
+        ref_price = float(preco)
+
+    legs = []
+    mensagens = []
+
+    def _get_step(info: dict | None) -> tuple[float, float, float] | None:
+        if not info or not isinstance(info.data, dict):
+            return None
+        d = info.data
+        return float(d.get("volume_min", 0)), float(d.get("volume_step", 1)), float(d.get("volume_max", 0))
+
+    base_rules = _get_step(base_info)
+    frac_rules = _get_step(frac_info) if frac_info.ok else None
+
+    if modo == "quantidade":
+        if quantidade is None:
+            return Response({"detail": "Informe a quantidade"}, status=400)
+        qtd = float(quantidade)
+        if base_rules:
+            minv, step, _ = base_rules
+            qtd_lote = (qtd // step) * step
+            rem = qtd - qtd_lote
+        else:
+            qtd_lote, rem = 0, qtd
+
+        if qtd_lote > 0:
+            legs.append({"symbol": ticker_base, "quantidade": int(qtd_lote)})
+        if rem > 0 and frac_rules:
+            minf, stepf, _ = frac_rules
+            # ajusta restante para step do fracionário
+            rem_adj = int(rem // stepf) * stepf
+            if rem_adj > 0:
+                legs.append({"symbol": frac_ticker, "quantidade": int(rem_adj)})
+            else:
+                mensagens.append("Quantidade remanescente não respeita step do fracionário")
+
+        if not legs:
+            return Response({"detail": "Quantidade não respeita os passos de volume"}, status=400)
+
+    else:  # modo == 'valor'
+        if valor is None:
+            return Response({"detail": "Informe o valor da compra"}, status=400)
+        if not ref_price:
+            return Response({"detail": "Sem preço de referência para cálculo"}, status=400)
+        val = float(valor)
+        qtd_lote = 0
+        if base_rules:
+            minv, step, _ = base_rules
+            custo_lote = ref_price * step
+            if custo_lote > 0:
+                qtd_lote = int(val // custo_lote) * step
+                val -= qtd_lote * ref_price
+        if qtd_lote > 0:
+            legs.append({"symbol": ticker_base, "quantidade": int(qtd_lote)})
+
+        # fracionário com o restante
+        if frac_rules and val > 0:
+            minf, stepf, _ = frac_rules
+            qtd_frac = int(val // (ref_price * stepf)) * stepf
+            if qtd_frac > 0:
+                legs.append({"symbol": frac_ticker, "quantidade": int(qtd_frac)})
+
+        if not legs:
+            return Response({"detail": "Valor insuficiente para os passos de volume"}, status=400)
+
+    # valida cada perna via /validar-ordem
+    validacoes = []
+    for lg in legs:
+        params = {
+            "ticker": lg["symbol"],
+            "tipo": "compra",
+            "quantidade": lg["quantidade"],
+            "execucao": execucao,
+        }
+        if execucao == "limite":
+            params["preco"] = preco
+        params["tp"] = tp
+        v = mt5.validar_ordem(**params)
+        validacoes.append({"symbol": lg["symbol"], "ok": v.ok and isinstance(v.data, dict) and v.data.get("ok", False), "motivo": None if not v.ok else (v.data.get("motivo") if isinstance(v.data, dict) else None)})
+
+    return Response({
+        "ticker_base": ticker_base,
+        "execucao": execucao,
+        "preco": preco,
+        "tp": tp,
+        "legs_sugeridas": legs,
+        "validacoes": validacoes,
+        "mensagens": mensagens,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mt5_compra(request, cliente_id: int):
+    """
+    Envia as ordens (1..N) com TP quando possível. Grava MT5Order e retorna group_id + order_tickets.
+
+    Body:
+    {
+      "ticker_base": "PETR4",
+      "execucao": "mercado"|"limite",
+      "preco": 36.20,              # quando execucao=limite
+      "tp": 37.50,
+      "legs": [ {"symbol":"PETR4","quantidade":100}, {"symbol":"PETR4F","quantidade":7} ]
+    }
+    """
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    ip = _get_cliente_ip(cliente)
+    if not ip:
+        return Response({"detail": "Cliente sem IP configurado"}, status=400)
+
+    body = request.data or {}
+    ticker_base = str(body.get("ticker_base") or "").strip().upper()
+    execucao = (body.get("execucao") or "mercado").lower()
+    preco = body.get("preco")
+    tp = body.get("tp")
+    legs = body.get("legs") or []
+
+    if not ticker_base or not legs:
+        return Response({"detail": "Parâmetros inválidos"}, status=400)
+    if execucao not in ("mercado", "limite"):
+        return Response({"detail": "Execução inválida"}, status=400)
+    if execucao == "limite" and preco is None:
+        return Response({"detail": "Preço é obrigatório para ordem a limite"}, status=400)
+    if tp is None:
+        return Response({"detail": "TP (alvo) é obrigatório"}, status=400)
+
+    mt5 = MT5Client(ip)
+    group_id = uuid4()
+
+    # pega login da conta (best-effort)
+    acc = mt5.status()
+    account_login = None
+    try:
+        if acc.ok and isinstance(acc.data, dict):
+            account_login = (acc.data.get("conta") or {}).get("login")
+    except Exception:
+        account_login = None
+
+    results = []
+    for lg in legs:
+        symbol = lg.get("symbol")
+        qtd = lg.get("quantidade")
+        if not symbol or not qtd:
+            continue
+        payload = {
+            "ticker": symbol,
+            "tipo": "compra",
+            "quantidade": float(qtd),
+            "execucao": execucao,
+            "tp": float(tp),
+        }
+        if execucao == "limite":
+            payload["preco"] = float(preco)
+
+        # tenta enviar com TP
+        r = mt5.enviar_ordem(payload)
+        apply_tp_after_exec = False
+        response_json = None
+        order_ticket = None
+        retcode = None
+
+        if not r.ok:
+            # tenta reenviar sem TP se erro provável de stops
+            apply_tp_after_exec = True
+            payload.pop("tp", None)
+            r2 = mt5.enviar_ordem(payload)
+            if not r2.ok:
+                # registra como rejeitada
+                obj = MT5Order.objects.create(
+                    group_id=group_id,
+                    cliente=cliente,
+                    base_ticker=ticker_base,
+                    symbol=symbol,
+                    lado="compra",
+                    execucao=execucao,
+                    volume_req=qtd,
+                    price_req=preco if execucao == "limite" else None,
+                    tp_req=tp,
+                    apply_tp_after_exec=apply_tp_after_exec,
+                    account_login=account_login,
+                    status="rejeitada",
+                    response_json=str(r2.data if r2.data is not None else r2.error),
+                )
+                results.append({"symbol": symbol, "status": "rejeitada", "detail": obj.response_json})
+                continue
+            response_json = r2.data
+        else:
+            response_json = r.data
+
+        try:
+            order_ticket = int(response_json.get("order") or response_json.get("order_ticket") or 0)
+        except Exception:
+            order_ticket = None
+        try:
+            retcode = int(response_json.get("retcode") or 0)
+        except Exception:
+            retcode = None
+
+        MT5Order.objects.create(
+            group_id=group_id,
+            cliente=cliente,
+            base_ticker=ticker_base,
+            symbol=symbol,
+            lado="compra",
+            execucao=execucao,
+            volume_req=qtd,
+            price_req=preco if execucao == "limite" else None,
+            tp_req=tp,
+            apply_tp_after_exec=apply_tp_after_exec,
+            account_login=account_login,
+            order_ticket=order_ticket,
+            retcode=retcode,
+            response_json=str(response_json),
+            status="enviada",
+        )
+
+        results.append({"symbol": symbol, "order_ticket": order_ticket, "status": "enviada"})
+
+    return Response({"group_id": str(group_id), "results": results})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def mt5_compra_status(request, cliente_id: int, group_id):
+    """
+    Verifica status das ordens de um group_id. Quando todas executadas, cria OperacaoCarteira consolidada
+    e configura TP via SLTP se necessário.
+    """
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    ip = _get_cliente_ip(cliente)
+    if not ip:
+        return Response({"detail": "Cliente sem IP configurado"}, status=400)
+
+    mt5 = MT5Client(ip)
+    orders = list(MT5Order.objects.filter(cliente=cliente, group_id=group_id))
+    if not orders:
+        return Response({"detail": "group_id desconhecido"}, status=404)
+
+    # verifica deals por ordem
+    agora = timezone.now()
+    inicio_epoch = int((min(o.created_at for o in orders) - timedelta(hours=1)).timestamp())
+    fim_epoch = int((agora + timedelta(minutes=5)).timestamp())
+
+    deals_resp = mt5.historico_deals(inicio=inicio_epoch, fim=fim_epoch)
+    deals_by_order = {}
+    if deals_resp.ok and isinstance(deals_resp.data, list):
+        for d in deals_resp.data:
+            try:
+                order_id = int(d.get("order")) if isinstance(d, dict) else None
+            except Exception:
+                order_id = None
+            if not order_id:
+                continue
+            deals_by_order.setdefault(order_id, []).append(d)
+
+    # atualiza status local e consolida volumes
+    executed_all = True
+    summary = []
+    for o in orders:
+        o_status = o.status
+        order_deals = deals_by_order.get(int(o.order_ticket or 0), [])
+        vol_exec = 0.0
+        vwap_num = 0.0
+        for d in order_deals:
+            vol = float(d.get("volume", 0))
+            price = float(d.get("price", 0))
+            vol_exec += vol
+            vwap_num += vol * price
+            # upsert MT5Deal
+            try:
+                deal_ticket = int(d.get("ticket"))
+            except Exception:
+                deal_ticket = None
+            if deal_ticket:
+                MT5Deal.objects.get_or_create(
+                    deal_ticket=deal_ticket,
+                    defaults={
+                        "cliente": cliente,
+                        "order_ticket": int(d.get("order") or 0) or None,
+                        "position_ticket": int(d.get("position_id") or d.get("position") or 0) or None,
+                        "symbol": d.get("symbol"),
+                        "lado": "compra" if int(d.get("type", 0)) in (0, 2) else "venda",  # Buy/Buy limit/stop
+                        "volume": vol,
+                        "price": price,
+                        "commission": float(d.get("commission", 0) or 0),
+                        "swap": float(d.get("swap", 0) or 0),
+                        "profit": float(d.get("profit", 0) or 0),
+                        "time": datetime.fromtimestamp(int(d.get("time")), tz=timezone.utc),
+                        "magic": int(d.get("magic", 0) or 0) or None,
+                        "comment": d.get("comment"),
+                        "raw_json": json.dumps(d),
+                    }
+                )
+
+        if vol_exec >= float(o.volume_req):
+            if o_status != "executada":
+                o.status = "executada"
+                o.save(update_fields=["status", "updated_at"])
+            avg = (vwap_num / vol_exec) if vol_exec > 0 else None
+            summary.append({"symbol": o.symbol, "executada": True, "volume": vol_exec, "preco_medio": avg})
+        else:
+            executed_all = False
+            if o_status != "pendente":
+                o.status = "pendente"
+                o.save(update_fields=["status", "updated_at"])
+            summary.append({"symbol": o.symbol, "executada": False, "volume_exec": vol_exec})
+
+    # quando todas executadas, cria OperacaoCarteira consolidada e aplica TP via SLTP (se necessário)
+    created_operacao = None
+    if executed_all:
+        base = _base_from_symbol(orders[0].symbol)
+        # soma volumes e vwap por symbol
+        legs_vwap = {}
+        for s in summary:
+            if not s.get("executada"):
+                continue
+            symbol = s["symbol"]
+            legs_vwap[symbol] = {
+                "volume": float(s["volume"]),
+                "preco_medio": float(s.get("preco_medio") or 0),
+            }
+
+        total_vol = sum(v["volume"] for v in legs_vwap.values())
+        if total_vol > 0:
+            vwap_total = sum(v["volume"] * v["preco_medio"] for v in legs_vwap.values()) / total_vol
+        else:
+            vwap_total = 0.0
+
+        # acha acao base
+        try:
+            acao = Acao.objects.get(ticker=base)
+        except Acao.DoesNotExist:
+            acao = None
+
+        if acao is not None:
+            op = OperacaoCarteira(
+                cliente=cliente,
+                acao=acao,
+                data_compra=timezone.now().date(),
+                preco_unitario=Decimal(str(vwap_total)).quantize(Decimal("0.01")),
+                quantidade=int(total_vol),
+                valor_total_compra=Decimal(str(vwap_total * total_vol)).quantize(Decimal("0.01")),
+                valor_alvo=Decimal(str(orders[0].tp_req or 0)).quantize(Decimal("0.01")),
+            )
+            # Como OperacaoCarteira é unmanaged, usamos .save() assumindo tabela existente
+            op.save(force_insert=True)
+            created_operacao = op.id
+
+            # vincula legs com position_ticket corrente
+            # tenta obter posições para cada symbol
+            pos = mt5.posicoes()
+            pos_map = {}
+            if pos.ok and isinstance(pos.data, list):
+                for p in pos.data:
+                    if isinstance(p, dict):
+                        pos_map[p.get("symbol")] = p
+            for sym, data_leg in legs_vwap.items():
+                p = pos_map.get(sym)
+                position_ticket = int(p.get("ticket")) if p else None
+                OperacaoMT5Leg.objects.create(
+                    operacao=op,
+                    symbol=sym,
+                    position_ticket=position_ticket or 0,
+                    volume=Decimal(str(data_leg["volume"])),
+                    price_open=Decimal(str(data_leg["preco_medio"])),
+                    order_ticket=next((int(o.order_ticket or 0) for o in orders if o.symbol == sym), None),
+                    deal_tickets=None,
+                )
+
+            # aplica TP via SLTP se alguma ordem marcou apply_tp_after_exec
+            if any(o.apply_tp_after_exec for o in orders) and created_operacao:
+                alvo = float(orders[0].tp_req or 0)
+                for sym in legs_vwap.keys():
+                    p = pos_map.get(sym)
+                    if p and alvo > 0:
+                        mt5.ajustar_stop({"ticket": int(p.get("ticket")), "stop_gain": alvo})
+
+    return Response({
+        "executed_all": executed_all,
+        "summary": summary,
+        "created_operacao_id": created_operacao,
+    })
 
 
 def _run_recomendacoes():

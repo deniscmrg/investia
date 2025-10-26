@@ -2,7 +2,7 @@ import {
   IconButton, Tooltip, Tabs, Tab,
   Box, Typography, Table, TableHead, TableBody, TableRow, TableCell,
   TextField, Dialog, DialogTitle, DialogContent, DialogActions, Button, MenuItem,
-  Backdrop, CircularProgress, Stack
+  Backdrop, CircularProgress, Stack, RadioGroup, FormControlLabel, Radio, FormLabel, Chip
 } from "@mui/material";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -26,6 +26,25 @@ export default function Carteira() {
 
   const [resumo, setResumo] = useState(null);
   const [updatingQuotes, setUpdatingQuotes] = useState(false);
+
+  // ---------- MT5 Nova Compra (modais) ----------
+  const [openRecModal, setOpenRecModal] = useState(false);
+  const [openNovaCompraModal, setOpenNovaCompraModal] = useState(false);
+  const [recsDisponiveis, setRecsDisponiveis] = useState([]);
+  const [recSelecionada, setRecSelecionada] = useState(null);
+
+  const [execucao, setExecucao] = useState("mercado"); // mercado | limite
+  const [modoEntrada, setModoEntrada] = useState("quantidade"); // quantidade | valor
+  const [precoLimite, setPrecoLimite] = useState("");
+  const [tpAlvo, setTpAlvo] = useState("");
+  const [qtdDesejada, setQtdDesejada] = useState("");
+  const [valorDesejado, setValorDesejado] = useState("");
+  const [legsSugeridas, setLegsSugeridas] = useState([]);
+  const [validacoesLegs, setValidacoesLegs] = useState([]);
+  const [comprando, setComprando] = useState(false);
+  const [groupId, setGroupId] = useState(null);
+  const [compraStatus, setCompraStatus] = useState(null);
+  const compraIntervalRef = useRef(null);
 
   // form
   const [acao, setAcao] = useState("");
@@ -225,6 +244,106 @@ export default function Carteira() {
     }
   };
 
+  // ---------- MT5: Recs e Nova Compra ----------
+  const abrirNovaCompra = async () => {
+    try {
+      setOpenRecModal(true);
+      const recs = await api(`clientes/${id}/recomendacoes-disponiveis/`);
+      setRecsDisponiveis(Array.isArray(recs) ? recs : []);
+    } catch (e) {
+      console.error("Erro ao carregar recomendações:", e);
+      setRecsDisponiveis([]);
+    }
+  };
+
+  const confirmarRecomendacao = (item) => {
+    setRecSelecionada(item);
+    setOpenRecModal(false);
+    // reset form
+    setExecucao("mercado");
+    setModoEntrada("quantidade");
+    setPrecoLimite("");
+    setTpAlvo("");
+    setQtdDesejada("");
+    setValorDesejado("");
+    setLegsSugeridas([]);
+    setValidacoesLegs([]);
+    setOpenNovaCompraModal(true);
+  };
+
+  const validarDistribuicao = async () => {
+    if (!recSelecionada) return;
+    const body = {
+      ticker: recSelecionada.ticker,
+      modo: modoEntrada,
+      execucao,
+      tp: tpAlvo !== "" ? Number(tpAlvo) : null,
+    };
+    if (execucao === "limite") body.preco = precoLimite !== "" ? Number(precoLimite) : null;
+    if (modoEntrada === "quantidade") body.quantidade = qtdDesejada !== "" ? Number(qtdDesejada) : null;
+    if (modoEntrada === "valor") body.valor = valorDesejado !== "" ? Number(valorDesejado) : null;
+
+    try {
+      const res = await api(`clientes/${id}/mt5/compra/validar/`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setLegsSugeridas(res?.legs_sugeridas || []);
+      setValidacoesLegs(res?.validacoes || []);
+    } catch (e) {
+      console.error("Erro na validação:", e);
+      setLegsSugeridas([]);
+      setValidacoesLegs([]);
+    }
+  };
+
+  const enviarCompra = async () => {
+    if (!recSelecionada || !Array.isArray(legsSugeridas) || legsSugeridas.length === 0) return;
+    setComprando(true);
+    try {
+      const body = {
+        ticker_base: recSelecionada.ticker,
+        execucao,
+        tp: Number(tpAlvo),
+        legs: legsSugeridas.map((l) => ({ symbol: l.symbol, quantidade: Number(l.quantidade) })),
+      };
+      if (execucao === "limite") body.preco = Number(precoLimite);
+      const res = await api(`clientes/${id}/mt5/compra/`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (res?.group_id) {
+        setGroupId(res.group_id);
+        // iniciar polling
+        if (compraIntervalRef.current) clearInterval(compraIntervalRef.current);
+        compraIntervalRef.current = setInterval(async () => {
+          try {
+            const st = await api(`clientes/${id}/mt5/compra-status/${res.group_id}/`);
+            setCompraStatus(st);
+            if (st?.executed_all) {
+              clearInterval(compraIntervalRef.current);
+              compraIntervalRef.current = null;
+              // refresh carteira e resumo
+              const opsRes = await api(`operacoes/?cliente=${id}`);
+              const lista = opsRes.results || opsRes || [];
+              setOperacoes(lista);
+              await fetchResumo();
+              setComprando(false);
+              setOpenNovaCompraModal(false);
+            }
+          } catch (e) {
+            console.error("Erro no polling de compra:", e);
+          }
+        }, 3000);
+      } else {
+        setComprando(false);
+      }
+    } catch (e) {
+      console.error("Erro no envio de compra:", e);
+      setComprando(false);
+    }
+  };
+
   // ---------- filtragem por aba ----------
   const operacoesDoCliente = operacoes.filter(op => Number(op.cliente) === Number(id));
   let operacoesFiltradas = [];
@@ -243,8 +362,11 @@ export default function Carteira() {
       <Typography variant="h4" mb={2}>{cliente?.nome} - Carteira</Typography>
 
       <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
-        <Button variant="contained" onClick={() => handleOpen()}>
-          Nova Operação
+        <Button variant="contained" onClick={() => abrirNovaCompra()}>
+          Nova Compra (MT5)
+        </Button>
+        <Button variant="outlined" onClick={() => handleOpen()}>
+          Nova Operação (manual)
         </Button>
         <Button
           variant="outlined"
@@ -438,6 +560,112 @@ export default function Carteira() {
         <DialogActions>
           <Button onClick={handleClose}>Cancelar</Button>
           <Button variant="contained" onClick={handleSave}>{editing ? "Salvar" : "Criar"}</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Modal: Selecionar recomendação */}
+      <Dialog open={openRecModal} onClose={() => setOpenRecModal(false)} maxWidth="md" fullWidth>
+        <DialogTitle>Selecionar recomendação</DialogTitle>
+        <DialogContent>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>Ticker</TableCell>
+                <TableCell>Empresa</TableCell>
+                <TableCell align="right">Preço Ref</TableCell>
+                <TableCell align="right">Alvo Sug.</TableCell>
+                <TableCell align="right">Prob.</TableCell>
+                <TableCell></TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {recsDisponiveis.map((r) => (
+                <TableRow key={r.acao_id}>
+                  <TableCell>{r.ticker}</TableCell>
+                  <TableCell>{r.empresa}</TableCell>
+                  <TableCell align="right">{formatCurrency(r.preco_compra)}</TableCell>
+                  <TableCell align="right">{formatCurrency(r.alvo_sugerido)}</TableCell>
+                  <TableCell align="right">{r.probabilidade}%</TableCell>
+                  <TableCell>
+                    <Button variant="contained" size="small" onClick={() => confirmarRecomendacao(r)}>Selecionar</Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenRecModal(false)}>Fechar</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Modal: Nova Compra MT5 */}
+      <Dialog open={openNovaCompraModal} onClose={() => setOpenNovaCompraModal(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Nova Compra (MT5) — {recSelecionada?.ticker}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField select label="Execução" value={execucao} onChange={(e) => setExecucao(e.target.value)}>
+              <MenuItem value="mercado">Mercado</MenuItem>
+              <MenuItem value="limite">Limite</MenuItem>
+            </TextField>
+            {execucao === "limite" && (
+              <TextField label="Preço Limite" type="number" value={precoLimite} onChange={(e) => setPrecoLimite(e.target.value)} />
+            )}
+
+            <FormLabel>Entrada</FormLabel>
+            <RadioGroup row value={modoEntrada} onChange={(e) => setModoEntrada(e.target.value)}>
+              <FormControlLabel value="quantidade" control={<Radio />} label="Quantidade" />
+              <FormControlLabel value="valor" control={<Radio />} label="Valor (R$)" />
+            </RadioGroup>
+
+            {modoEntrada === "quantidade" ? (
+              <TextField label="Quantidade desejada" type="number" value={qtdDesejada} onChange={(e) => setQtdDesejada(e.target.value)} />
+            ) : (
+              <TextField label="Valor desejado (R$)" type="number" value={valorDesejado} onChange={(e) => setValorDesejado(e.target.value)} />
+            )}
+
+            <TextField label="Alvo (TP)" type="number" value={tpAlvo} onChange={(e) => setTpAlvo(e.target.value)} />
+
+            <Stack direction="row" spacing={1}>
+              <Button variant="outlined" onClick={validarDistribuicao}>Validar</Button>
+              <Chip label={`Legs: ${legsSugeridas.length}`} />
+            </Stack>
+
+            {legsSugeridas.map((l, idx) => (
+              <Stack key={`${l.symbol}-${idx}`} direction="row" spacing={2} alignItems="center">
+                <TextField label="Símbolo" value={l.symbol} size="small" InputProps={{ readOnly: true }} />
+                <TextField label="Quantidade" type="number" value={l.quantidade} size="small" onChange={(e) => {
+                  const v = e.target.value;
+                  setLegsSugeridas((old) => old.map((x, i) => i === idx ? { ...x, quantidade: v } : x));
+                }} />
+              </Stack>
+            ))}
+
+            {validacoesLegs?.length > 0 && (
+              <Stack spacing={0.5}>
+                {validacoesLegs.map((v, i) => (
+                  <Typography key={i} variant="caption" color={v.ok ? "green" : "red"}>
+                    {v.symbol}: {v.ok ? "OK" : (v.motivo || "inválido")}
+                  </Typography>
+                ))}
+              </Stack>
+            )}
+
+            {groupId && (
+              <Box sx={{ mt: 1 }}>
+                <Typography variant="body2">Acompanhamento (grupo {groupId})</Typography>
+                {compraStatus?.summary?.map((s, i) => (
+                  <Typography key={i} variant="caption">
+                    {s.symbol}: {s.executada ? `executada vol ${s.volume}` : `parcial vol ${s.volume_exec ?? 0}`}
+                  </Typography>
+                ))}
+              </Box>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenNovaCompraModal(false)} disabled={comprando}>Cancelar</Button>
+          <Button variant="contained" onClick={enviarCompra} disabled={comprando || legsSugeridas.length === 0}>Enviar</Button>
         </DialogActions>
       </Dialog>
 
