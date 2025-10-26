@@ -1679,37 +1679,55 @@ def _run_recomendacoes():
     except Exception as e:
         return False, f"Falha ao executar: {e}"  
 
-@api_view(["GET", "POST"])
+@api_view(["GET", "POST"]) 
 @permission_classes([IsAuthenticated])
 def recomendacoes_api(request):
     """
-    GET: retorna dados da vw_recomendacoes_diarias_atual_nova
+    GET: retorna dados da vw_recomendacoes_diarias_atual_nova (view "Nova")
     POST: dispara a rotina _run_recomendacoes()
     """
-    from .models import RecomendacaoDiariaAtual  # importa dentro pra evitar loop
+    from .models import RecomendacaoDiariaAtualNova  # usa a view Nova
     if request.method == "POST":
         ok, msg = _run_recomendacoes()
         status = "success" if ok else "error"
         return JsonResponse({"status": status, "message": msg})
 
-    qs = RecomendacaoDiariaAtual.objects.all().order_by("-data")
-    dados = [
-        {
+    qs = RecomendacaoDiariaAtualNova.objects.all().order_by("-data")
+
+    def _f(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    dados = []
+    for r in qs:
+        dados.append({
             "acao_id": r.acao_id,
             "ticker": r.ticker,
             "empresa": r.empresa,
             "setor": r.setor,
             "data": r.data,
-            "preco_compra": float(r.preco_compra or 0),
-            "alvo_sugerido": float(r.alvo_sugerido or 0),
-            "percentual_estimado": float(r.percentual_estimado or 0),
-            "probabilidade": float(r.probabilidade or 0),
+            "preco_compra": _f(r.preco_compra),
+            "alvo_sugerido": _f(r.alvo_sugerido),
+            "percentual_estimado": _f(r.percentual_estimado),
+            "probabilidade": _f(r.probabilidade),
             "vezes_atingiu_alvo_1m": r.vezes_atingiu_alvo_1m,
-            "cruza_medias": bool(r.cruza_medias),
-            "obv_cres": bool(r.obv_cres),
-            "vol_acima_media": bool(r.vol_acima_media),
-            "wma602": float(r.wma602 or 0),
-        }
-        for r in qs
-    ]
+            "cruza_medias": bool(r.cruza_medias) if r.cruza_medias is not None else None,
+            "obv_cres": bool(r.obv_cres) if r.obv_cres is not None else None,
+            "vol_acima_media": bool(r.vol_acima_media) if r.vol_acima_media is not None else None,
+            # wma602 é decimal nessa view
+            "wma602": _f(r.wma602),
+            # Campos adicionais da view Nova
+            "MIN": _f(getattr(r, "MIN", None)),
+            "MAX": _f(getattr(r, "MAX", None)),
+            "ALTA": _f(getattr(r, "ALTA", None)),
+            "BAIXA": _f(getattr(r, "BAIXA", None)),
+            "AMPLITUDE": _f(getattr(r, "AMPLITUDE", None)),
+            "AMP_AxF": _f(getattr(r, "AMP_AxF", None)),
+            "AMP_MXxMN": _f(getattr(r, "AMP_MXxMN", None)),
+            "A_x_F": _f(getattr(r, "A_x_F", None)),
+            "ALVO": _f(getattr(r, "ALVO", None)),
+        })
+
     return JsonResponse(dados, safe=False)

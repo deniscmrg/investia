@@ -48,20 +48,32 @@ export default function Recomendacoes() {
         <Table>
           <TableHead>
             <TableRow>
-              <TableCell>Ticker</TableCell>
-              <TableCell>Empresa</TableCell>
-              <TableCell>Setor</TableCell>
-              <TableCell>Data</TableCell>
-              <TableCell>Preço compra</TableCell>
-              <TableCell>Alvo sugerido</TableCell>
-              <TableCell>% Estimado</TableCell>
-              <TableCell>Probabilidade</TableCell>
-              <TableCell>Vezes alvo 1m</TableCell>
-              <TableCell>Cruza médias</TableCell>
-              <TableCell>OBV ↑</TableCell>
-              <TableCell>Volume ↑</TableCell>
-              <TableCell>WMA602</TableCell>
-              <TableCell>Origem</TableCell>
+              {[
+                "Ticker",
+                "Empresa",
+                "Setor",
+                "Data",
+                "Preço compra",
+                "Alvo sugerido",
+                "% Estimado",
+                "Probabilidade",
+                "Vezes alvo 1m",
+                "Cruza médias",
+                "OBV ↑",
+                "Volume ↑",
+                "WMA602",
+                "MIN",
+                "MAX",
+                "AMPLITUDE",
+                "AMP A×F",
+                "AMP MX×MN",
+                "A×F",
+                "ALVO",
+                "ALTA",
+                "BAIXA",
+              ].map((h, idx) => (
+                <TableCell key={idx}>{h}</TableCell>
+              ))}
             </TableRow>
           </TableHead>
           <TableBody>
@@ -71,19 +83,27 @@ export default function Recomendacoes() {
                 <TableCell>{r.empresa}</TableCell>
                 <TableCell>{r.setor}</TableCell>
                 <TableCell>{r.data}</TableCell>
-                <TableCell>{r.preco_compra}</TableCell>
-                <TableCell>{r.alvo_sugerido}</TableCell>
-                <TableCell>{r.percentual_estimado}</TableCell>
-                <TableCell>{r.probabilidade}</TableCell>
+                <TableCell>{Number(r.preco_compra)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.alvo_sugerido)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.percentual_estimado)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}%</TableCell>
+                <TableCell>{Number(r.probabilidade)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}%</TableCell>
                 <TableCell>{r.vezes_atingiu_alvo_1m}</TableCell>
                 <TableCell>{r.cruza_medias ? "✅" : "❌"}</TableCell>
                 <TableCell>{r.obv_cres ? "✅" : "❌"}</TableCell>
                 <TableCell>{r.vol_acima_media ? "✅" : "❌"}</TableCell>
-                <TableCell>{r.wma602 ? "✅" : "❌"}</TableCell>
-                <TableCell>{r.origem}</TableCell>
+                <TableCell>{Number(r.wma602)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.MIN)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.MAX)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.AMPLITUDE)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.AMP_AxF)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.AMP_MXxMN)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.A_x_F)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.ALVO)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.ALTA)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
+                <TableCell>{Number(r.BAIXA)?.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2})}</TableCell>
               </TableRow>
             )) : (
-              <TableRow><TableCell colSpan={14} align="center">Nenhum registro encontrado.</TableCell></TableRow>
+              <TableRow><TableCell colSpan={22} align="center">Nenhum registro encontrado.</TableCell></TableRow>
             )}
           </TableBody>
         </Table>
