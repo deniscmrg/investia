@@ -503,6 +503,7 @@ export default function Carteira() {
               {tabIndex === 1 && <TableCell align="center">Preço Atual</TableCell>}
               {tabIndex === 1 && <TableCell align="center">Variação (%)</TableCell>}
               {tabIndex === 1 && <TableCell align="center">To Gain (%)</TableCell>}
+              {tabIndex === 1 && <TableCell align="center">Status</TableCell>}
 
               {/* REALIZADAS */}
               {tabIndex === 2 && <TableCell>Data Venda</TableCell>}
@@ -565,6 +566,21 @@ export default function Carteira() {
                   {tabIndex === 1 && (
                     <TableCell align="center" sx={{ color: toGain !== "-" && Number(toGain) <= 0 ? "green" : "orange" }}>
                       {toGain}%
+                    </TableCell>
+                  )}
+
+                  {tabIndex === 1 && (
+                    <TableCell align="center">
+                      {(() => {
+                        const raw = op.status;
+                        const label = raw && raw !== 'manual' ? String(raw) : 'n/d';
+                        let chipColor = 'default';
+                        if (label === 'executada') chipColor = 'success';
+                        else if (label === 'parcial') chipColor = 'warning';
+                        else if (label === 'pendente') chipColor = 'info';
+                        else if (label === 'falha') chipColor = 'error';
+                        return <Chip size="small" label={label} color={chipColor} variant={label==='n/d' ? 'outlined' : 'filled'} />;
+                      })()}
                     </TableCell>
                   )}
 

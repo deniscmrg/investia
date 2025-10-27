@@ -16,7 +16,9 @@ import {
   MenuItem,
   Button,
 } from "@mui/material";
+import { Chip } from "@mui/material";
 import api from "../../services/api";
+import { useNavigate } from "react-router-dom";
 
 // --- helpers de ordenação ---
 function descendingComparator(a, b, orderBy) {
@@ -63,11 +65,14 @@ const formatPercentBR = (v) =>
       })}%`;
 
 export default function DashboardRV() {
+  const navigate = useNavigate();
   const [tabIndex, setTabIndex] = useState(0);
   const [posicionadas, setPosicionadas] = useState([]);
+  const [statusById, setStatusById] = useState({});
   const [patrimonio, setPatrimonio] = useState([]);
   const [recs, setRecs] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [qtdPosicionadasByCliente, setQtdPosicionadasByCliente] = useState({});
 
   // filtros
   const [filtroCliente, setFiltroCliente] = useState("");
@@ -102,6 +107,70 @@ export default function DashboardRV() {
   useEffect(() => {
     fetchDashboard();
   }, []);
+
+  // carrega quantidade total de ações posicionadas por cliente
+  useEffect(() => {
+    const loadQtdPosicionadas = async () => {
+      try {
+        const ids = Array.from(new Set((patrimonio || []).map((p) => p.codigo).filter(Boolean)));
+        if (!ids.length) {
+          setQtdPosicionadasByCliente({});
+          return;
+        }
+        const results = await Promise.all(ids.map(async (id) => {
+          try {
+            const res = await api(`operacoes/?cliente=${id}`);
+            const lista = res?.results || res || [];
+            const soma = lista.filter((op) => !op.data_venda).reduce((acc, op) => acc + (Number(op.quantidade) || 0), 0);
+            return [id, soma];
+          } catch (e) {
+            return [id, 0];
+          }
+        }));
+        setQtdPosicionadasByCliente(Object.fromEntries(results));
+      } catch (e) {
+        // silencioso
+      }
+    };
+    loadQtdPosicionadas();
+  }, [patrimonio]);
+
+  // busca status por operação (GET operacoes/<id>/), usa serializer com 'status'
+  useEffect(() => {
+    const loadStatuses = async () => {
+      try {
+        const ids = Array.from(new Set((posicionadas || []).map((p) => p.id).filter(Boolean)));
+        if (!ids.length) {
+          setStatusById({});
+          return;
+        }
+        const results = await Promise.all(ids.map(async (id) => {
+          try {
+            const res = await api(`operacoes/${id}/`);
+            const raw = res?.status;
+            const label = raw && raw !== 'manual' ? String(raw) : 'n/d';
+            return [id, label];
+          } catch (e) {
+            return [id, 'n/d'];
+          }
+        }));
+        const map = Object.fromEntries(results);
+        setStatusById(map);
+      } catch (e) {
+        // silencioso
+      }
+    };
+    loadStatuses();
+  }, [posicionadas]);
+
+  const renderStatusChip = (label) => {
+    let color = 'default';
+    if (label === 'executada') color = 'success';
+    else if (label === 'parcial') color = 'warning';
+    else if (label === 'pendente') color = 'info';
+    else if (label === 'falha') color = 'error';
+    return <Chip size="small" label={label} color={color} variant={label==='n/d' ? 'outlined' : 'filled'} />;
+  };
 
   const LoadingModal = () => (
     <Modal open={loading}>
@@ -239,6 +308,7 @@ export default function DashboardRV() {
                     </TableSortLabel>
                   </TableCell>
                 ))}
+                <TableCell>Status</TableCell>
               </TableRow>
             </TableHead>
 
@@ -261,10 +331,11 @@ export default function DashboardRV() {
                       {formatPercentBR(op.lucro_percentual)}
                     </TableCell>
                     <TableCell>{formatCurrencyBRL(op.valor_alvo)}</TableCell>
-                    <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
-                  </TableRow>
-                )
-              )}
+                  <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
+                    <TableCell>{renderStatusChip(statusById[op.id] || 'n/d')}</TableCell>
+                </TableRow>
+              )
+            )}
             </TableBody>
           </Table>
         </>
@@ -280,6 +351,8 @@ export default function DashboardRV() {
               <TableCell>Patrimônio</TableCell>
               <TableCell>Total Consolidado</TableCell>
               <TableCell>Valor Disponível</TableCell>
+              <TableCell>Qtd Ações</TableCell>
+              <TableCell>Ações</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -290,6 +363,12 @@ export default function DashboardRV() {
                 <TableCell>{formatCurrencyBRL(cli.patrimonio)}</TableCell>
                 <TableCell>{formatCurrencyBRL(cli.total_consolidado)}</TableCell>
                 <TableCell>{formatCurrencyBRL(cli.valor_disponivel)}</TableCell>
+                <TableCell>{qtdPosicionadasByCliente[cli.codigo] ?? '-'}</TableCell>
+                <TableCell>
+                  <Button size="small" variant="contained" onClick={() => navigate(`/clientes/${cli.codigo}/carteira`)}>
+                    Abrir Carteira
+                  </Button>
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>

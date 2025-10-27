@@ -1,7 +1,7 @@
 from datetime import date
 from django.contrib.auth.models import User
 from rest_framework import serializers
-from .models import Cliente, Acao, OperacaoCarteira, Patrimonio, Custodia, RecomendacaoDiariaAtualNova
+from .models import Cliente, Acao, OperacaoCarteira, Patrimonio, Custodia, RecomendacaoDiariaAtualNova, MT5Order, OperacaoMT5Leg
 from decimal import Decimal, InvalidOperation
 
 class UserSerializer(serializers.ModelSerializer):
@@ -30,6 +30,7 @@ class OperacaoCarteiraSerializer(serializers.ModelSerializer):
     valor_total_venda  = serializers.SerializerMethodField()
     lucro_percentual   = serializers.SerializerMethodField()
     dias_posicionado   = serializers.SerializerMethodField()
+    status             = serializers.SerializerMethodField()
 
     class Meta:
         model = OperacaoCarteira
@@ -48,6 +49,7 @@ class OperacaoCarteiraSerializer(serializers.ModelSerializer):
             "valor_alvo",
             "lucro_percentual",
             "dias_posicionado",
+            "status",
         ]
         read_only_fields = [
             "valor_total_compra",
@@ -90,6 +92,38 @@ class OperacaoCarteiraSerializer(serializers.ModelSerializer):
         try:
             if obj.data_compra:
                 return (date.today() - obj.data_compra).days
+        except Exception:
+            pass
+        return None
+
+    def get_status(self, obj):
+        try:
+            # Encerrada
+            if getattr(obj, "data_venda", None):
+                return "encerrada"
+
+            # Executada quando já temos legs vinculadas
+            try:
+                if OperacaoMT5Leg.objects.filter(operacao=obj).exists():
+                    return "executada"
+            except Exception:
+                pass
+
+            # Vínculo por request_id nos MT5Order (op:<id>)
+            req_id = f"op:{obj.id}"
+            ords = list(MT5Order.objects.filter(cliente=obj.cliente, request_id=req_id))
+            if not ords:
+                return "manual"  # operação criada manualmente (sem MT5)
+
+            statuses = {str(getattr(o, "status", "")).lower() for o in ords}
+            if statuses and statuses.issubset({"executada"}):
+                return "executada"
+            if "executada" in statuses or "parcial" in statuses:
+                return "parcial"
+            if "pendente" in statuses or "enviada" in statuses:
+                return "pendente"
+            if statuses and statuses.issubset({"rejeitada", "cancelada"}):
+                return "falha"
         except Exception:
             pass
         return None
@@ -180,4 +214,3 @@ class RecomendacaoDiariaAtualNovaSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecomendacaoDiariaAtualNova
         fields = "__all__"
-

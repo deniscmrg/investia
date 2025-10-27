@@ -141,6 +141,91 @@ class OperacaoCarteiraViewSet(viewsets.ModelViewSet):
             qs = qs.filter(cliente=cliente_id_int)
         return qs
 
+    def _reconcile_pending_partial(self, qs):
+        try:
+            abertos = list(qs.filter(data_venda__isnull=True))
+        except Exception:
+            return
+        if not abertos:
+            return
+        now = timezone.now()
+        lookback = timedelta(minutes=15)
+        for op in abertos:
+            try:
+                req_id = f"op:{op.id}"
+                ords = list(MT5Order.objects.filter(cliente=op.cliente, request_id=req_id))
+                if not ords:
+                    continue
+                # já executadas, não precisa reconciliar
+                if all(str(getattr(o, "status", "")).lower() == "executada" for o in ords):
+                    continue
+                # janela temporal para evitar chamadas excessivas
+                min_created = None
+                for o in ords:
+                    dt = getattr(o, "created_at", None)
+                    if dt and (min_created is None or dt < min_created):
+                        min_created = dt
+                if min_created and (now - min_created) > lookback:
+                    # se há ordens antigas, ainda assim tenta uma vez reconciliar
+                    pass
+
+                ip = _get_cliente_ip(op.cliente)
+                if not ip:
+                    continue
+                mt5 = MT5Client(ip)
+                inicio_epoch = int(((min_created or now) - timedelta(hours=1)).timestamp())
+                fim_epoch = int((now + timedelta(minutes=5)).timestamp())
+                deals_resp = mt5.historico_deals(inicio=inicio_epoch, fim=fim_epoch)
+                if not deals_resp.ok or not isinstance(deals_resp.data, list):
+                    continue
+                deals_by_order = {}
+                for d in deals_resp.data:
+                    try:
+                        order_id = int(d.get("order")) if isinstance(d, dict) else None
+                    except Exception:
+                        order_id = None
+                    if not order_id:
+                        continue
+                    deals_by_order.setdefault(order_id, []).append(d)
+
+                for o in ords:
+                    try:
+                        order_id = int(o.order_ticket or 0)
+                    except Exception:
+                        order_id = 0
+                    order_deals = deals_by_order.get(order_id, [])
+                    vol_exec = 0.0
+                    for d in order_deals:
+                        try:
+                            vol_exec += float(d.get("volume", 0) or 0)
+                        except Exception:
+                            pass
+                    try:
+                        vol_req = float(o.volume_req or 0)
+                    except Exception:
+                        vol_req = 0.0
+                    new_status = None
+                    if vol_req > 0 and vol_exec >= vol_req:
+                        new_status = "executada"
+                    elif vol_exec > 0:
+                        new_status = "parcial"
+                    else:
+                        # mantém pendente/enviada
+                        if str(getattr(o, "status", "")).lower() in ("enviada", "pendente", "parcial"):
+                            new_status = str(o.status)
+                    if new_status and new_status != o.status:
+                        o.status = new_status
+                        o.save(update_fields=["status", "updated_at"])
+            except Exception:
+                # não interrompe reconciliação em caso de erro de uma operação
+                continue
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        # reconcilia status das operações abertas (pendentes/parciais) via MT5
+        self._reconcile_pending_partial(qs)
+        return super().list(request, *args, **kwargs)
+
 
 class AcaoViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Acao.objects.all()
@@ -1326,6 +1411,49 @@ def mt5_compra(request, cliente_id: int):
     except Exception:
         account_login = None
 
+    # cria placeholder em OperacaoCarteira imediatamente (vinculado via request_id nos MT5Order)
+    placeholder_op = None
+    try:
+        acao = Acao.objects.get(ticker=ticker_base)
+    except Acao.DoesNotExist:
+        acao = None
+
+    total_qty = 0
+    try:
+        total_qty = sum(int(lg.get("quantidade") or 0) for lg in (legs or []) if isinstance(lg, dict))
+    except Exception:
+        total_qty = 0
+
+    # preço estimado: limite usa preco informado; mercado tenta ask/last; fallback 0
+    ref_price = None
+    try:
+        if execucao == "limite" and preco is not None:
+            ref_price = float(preco)
+        else:
+            q = mt5.cotacao(ticker_base)
+            if q.ok and isinstance(q.data, dict):
+                ref_price = float(q.data.get("ask") or q.data.get("last") or 0) or None
+    except Exception:
+        ref_price = None
+
+    if acao is not None and total_qty > 0:
+        try:
+            pu = Decimal(str(ref_price if ref_price is not None else 0)).quantize(Decimal("0.01"))
+            vtc = (pu * Decimal(str(total_qty))).quantize(Decimal("0.01"))
+            placeholder_op = OperacaoCarteira(
+                cliente=cliente,
+                acao=acao,
+                data_compra=timezone.now().date(),
+                preco_unitario=pu,
+                quantidade=int(total_qty),
+                valor_total_compra=vtc,
+                valor_alvo=(Decimal(str(tp)).quantize(Decimal("0.01")) if tp is not None else None),
+            )
+            # tabela é unmanaged; assume existir no banco
+            placeholder_op.save(force_insert=True)
+        except Exception:
+            placeholder_op = None
+
     results = []
     for lg in legs:
         symbol = lg.get("symbol")
@@ -1368,6 +1496,7 @@ def mt5_compra(request, cliente_id: int):
                     tp_req=tp,
                     apply_tp_after_exec=apply_tp_after_exec,
                     account_login=account_login,
+                    request_id=(f"op:{placeholder_op.id}" if placeholder_op else None),
                     status="rejeitada",
                     response_json=str(r2.data if r2.data is not None else r2.error),
                 )
@@ -1401,6 +1530,7 @@ def mt5_compra(request, cliente_id: int):
             order_ticket=order_ticket,
             retcode=retcode,
             response_json=str(response_json),
+            request_id=(f"op:{placeholder_op.id}" if placeholder_op else None),
             status="enviada",
         )
 
@@ -1494,8 +1624,9 @@ def mt5_compra_status(request, cliente_id: int, group_id):
             summary.append({"symbol": o.symbol, "executada": True, "volume": vol_exec, "preco_medio": avg})
         else:
             executed_all = False
-            if o_status != "pendente":
-                o.status = "pendente"
+            new_status = "parcial" if vol_exec > 0 else "pendente"
+            if o_status != new_status:
+                o.status = new_status
                 o.save(update_fields=["status", "updated_at"])
             summary.append({"symbol": o.symbol, "executada": False, "volume_exec": vol_exec})
 
@@ -1526,18 +1657,49 @@ def mt5_compra_status(request, cliente_id: int, group_id):
         except Acao.DoesNotExist:
             acao = None
 
+        # tenta localizar placeholder previamente criado via request_id
+        placeholder_id = None
+        try:
+            for o in orders:
+                rid = getattr(o, "request_id", None)
+                if isinstance(rid, str) and rid.startswith("op:"):
+                    try:
+                        placeholder_id = int(rid.split(":", 1)[1])
+                        break
+                    except Exception:
+                        placeholder_id = None
+        except Exception:
+            placeholder_id = None
+
         if acao is not None:
-            op = OperacaoCarteira(
-                cliente=cliente,
-                acao=acao,
-                data_compra=timezone.now().date(),
-                preco_unitario=Decimal(str(vwap_total)).quantize(Decimal("0.01")),
-                quantidade=int(total_vol),
-                valor_total_compra=Decimal(str(vwap_total * total_vol)).quantize(Decimal("0.01")),
-                valor_alvo=Decimal(str(orders[0].tp_req or 0)).quantize(Decimal("0.01")),
-            )
-            # Como OperacaoCarteira é unmanaged, usamos .save() assumindo tabela existente
-            op.save(force_insert=True)
+            op = None
+            if placeholder_id:
+                try:
+                    op = OperacaoCarteira.objects.get(pk=placeholder_id, cliente=cliente)
+                except OperacaoCarteira.DoesNotExist:
+                    op = None
+            if op is None:
+                op = OperacaoCarteira(
+                    cliente=cliente,
+                    acao=acao,
+                    data_compra=timezone.now().date(),
+                    preco_unitario=Decimal(str(vwap_total)).quantize(Decimal("0.01")),
+                    quantidade=int(total_vol),
+                    valor_total_compra=Decimal(str(vwap_total * total_vol)).quantize(Decimal("0.01")),
+                    valor_alvo=Decimal(str(orders[0].tp_req or 0)).quantize(Decimal("0.01")),
+                )
+                op.save(force_insert=True)
+            else:
+                # atualiza placeholder com valores executados
+                try:
+                    op.preco_unitario = Decimal(str(vwap_total)).quantize(Decimal("0.01"))
+                    op.quantidade = int(total_vol)
+                    op.valor_total_compra = Decimal(str(vwap_total * total_vol)).quantize(Decimal("0.01"))
+                    if getattr(orders[0], "tp_req", None) is not None:
+                        op.valor_alvo = Decimal(str(orders[0].tp_req)).quantize(Decimal("0.01"))
+                    op.save(update_fields=["preco_unitario", "quantidade", "valor_total_compra", "valor_alvo"])
+                except Exception:
+                    pass
             created_operacao = op.id
 
             # vincula legs com position_ticket corrente
@@ -1551,15 +1713,22 @@ def mt5_compra_status(request, cliente_id: int, group_id):
             for sym, data_leg in legs_vwap.items():
                 p = pos_map.get(sym)
                 position_ticket = int(p.get("ticket")) if p else None
-                OperacaoMT5Leg.objects.create(
-                    operacao=op,
-                    symbol=sym,
-                    position_ticket=position_ticket or 0,
-                    volume=Decimal(str(data_leg["volume"])),
-                    price_open=Decimal(str(data_leg["preco_medio"])),
-                    order_ticket=next((int(o.order_ticket or 0) for o in orders if o.symbol == sym), None),
-                    deal_tickets=None,
-                )
+                try:
+                    # evita duplicadas se o status for consultado repetidas vezes
+                    from django.db.models import Q
+                    exists = OperacaoMT5Leg.objects.filter(operacao=op, symbol=sym).exists()
+                    if not exists:
+                        OperacaoMT5Leg.objects.create(
+                            operacao=op,
+                            symbol=sym,
+                            position_ticket=position_ticket or 0,
+                            volume=Decimal(str(data_leg["volume"])),
+                            price_open=Decimal(str(data_leg["preco_medio"])),
+                            order_ticket=next((int(o.order_ticket or 0) for o in orders if o.symbol == sym), None),
+                            deal_tickets=None,
+                        )
+                except Exception:
+                    pass
 
             # aplica TP via SLTP se alguma ordem marcou apply_tp_after_exec
             if any(o.apply_tp_after_exec for o in orders) and created_operacao:
@@ -1574,6 +1743,9 @@ def mt5_compra_status(request, cliente_id: int, group_id):
         "summary": summary,
         "created_operacao_id": created_operacao,
     })
+
+
+    
 
 
 # =============================
