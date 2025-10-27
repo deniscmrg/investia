@@ -18,17 +18,30 @@ async function apiFetch(endpoint, options = {}) {
   };
 
   const res = await fetch(`${API_URL}${endpoint}`, { ...options, headers });
-  if (!res.ok) {
-    throw new Error(`Erro ${res.status}: ${res.statusText}`);
+
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
   }
 
-  // Se não tiver corpo (ex: DELETE retorna 204), não tenta parsear JSON
-  const text = await res.text();
-  try {
-    return text ? JSON.parse(text) : null;
-  } catch {
-    return null;
+  if (!res.ok) {
+    const detail =
+      (data && typeof data === "object" && data.detail) ||
+      (typeof data === "string" ? data : null) ||
+      res.statusText ||
+      "Erro ao comunicar com a API";
+    const error = new Error(detail);
+    error.status = res.status;
+    error.payload = data;
+    throw error;
   }
+
+  return data;
 
 }
 

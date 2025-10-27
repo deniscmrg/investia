@@ -2,7 +2,7 @@ import {
   IconButton, Tooltip, Tabs, Tab,
   Box, Typography, Table, TableHead, TableBody, TableRow, TableCell,
   TextField, Dialog, DialogTitle, DialogContent, DialogActions, Button, MenuItem,
-  Backdrop, CircularProgress, Stack, RadioGroup, FormControlLabel, Radio, FormLabel, Chip
+  Backdrop, CircularProgress, Stack, RadioGroup, FormControlLabel, Radio, FormLabel, Chip, Snackbar, Alert
 } from "@mui/material";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -19,6 +19,7 @@ export default function Carteira() {
   const [operacoes, setOperacoes] = useState([]);
   const [acoesDisponiveis, setAcoesDisponiveis] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [alerta, setAlerta] = useState({ open: false, severity: "info", text: "" });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -45,6 +46,14 @@ export default function Carteira() {
   const [groupId, setGroupId] = useState(null);
   const [compraStatus, setCompraStatus] = useState(null);
   const compraIntervalRef = useRef(null);
+  const mostrarAlerta = (text, severity = "info") => {
+    if (!text) return;
+    setAlerta({ open: true, severity, text });
+  };
+  const fecharAlerta = (_event, reason) => {
+    if (reason === "clickaway") return;
+    setAlerta((prev) => ({ ...prev, open: false }));
+  };
 
   // ---------- MT5 Venda (modal) ----------
   const [openVendaModal, setOpenVendaModal] = useState(false);
@@ -352,6 +361,11 @@ export default function Carteira() {
       setValidacoesLegs(res?.validacoes || []);
     } catch (e) {
       console.error("Erro na validação:", e);
+      if (e?.status === 409) {
+        mostrarAlerta(e.message || "Cliente já possui posição aberta para esse papel.", "warning");
+      } else {
+        mostrarAlerta("Erro ao validar a compra no MT5.", "error");
+      }
       setLegsSugeridas([]);
       setValidacoesLegs([]);
     }
@@ -400,6 +414,11 @@ export default function Carteira() {
       }
     } catch (e) {
       console.error("Erro no envio de compra:", e);
+      if (e?.status === 409) {
+        mostrarAlerta(e.message || "Cliente já possui posição ou ordem pendente para esse papel.", "warning");
+      } else {
+        mostrarAlerta("Não foi possível enviar a compra. Tente novamente.", "error");
+      }
       setComprando(false);
     }
   };
@@ -751,6 +770,17 @@ export default function Carteira() {
           <Button variant="contained" onClick={enviarCompra} disabled={comprando || legsSugeridas.length === 0}>Enviar</Button>
         </DialogActions>
       </Dialog>
+
+      <Snackbar
+        open={alerta.open}
+        autoHideDuration={6000}
+        onClose={fecharAlerta}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert onClose={fecharAlerta} severity={alerta.severity} variant="filled" sx={{ width: "100%" }}>
+          {alerta.text}
+        </Alert>
+      </Snackbar>
 
       <Backdrop sx={{ color: "#fff", zIndex: (theme) => theme.zIndex.drawer + 1 }} open={loading}>
         <CircularProgress color="inherit" />

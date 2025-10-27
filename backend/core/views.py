@@ -149,6 +149,43 @@ def _coerce_int(value) -> int | None:
         return None
 
 
+MT5_OPEN_ORDER_STATUSES: set[str] = {"enviada", "pendente", "parcial"}
+
+
+def _has_open_operacao(cliente: Cliente, base_ticker: str) -> bool:
+    try:
+        return OperacaoCarteira.objects.filter(
+            cliente=cliente, acao__ticker=base_ticker, data_venda__isnull=True
+        ).exists()
+    except Exception:
+        return False
+
+
+def _has_open_mt5_compra(cliente: Cliente, base_ticker: str) -> bool:
+    try:
+        return MT5Order.objects.filter(
+            cliente=cliente,
+            base_ticker=base_ticker,
+            lado="compra",
+            status__in=MT5_OPEN_ORDER_STATUSES,
+        ).exists()
+    except Exception:
+        return False
+
+
+def _position_conflict_response(cliente: Cliente, base_ticker: str):
+    """
+    Verifica se já existe posição ou ordem MT5 pendente para o cliente+ticker.
+    Retorna Response(409) quando existir conflito.
+    """
+    if not base_ticker:
+        return None
+    if _has_open_operacao(cliente, base_ticker) or _has_open_mt5_compra(cliente, base_ticker):
+        msg = f"Cliente já possui posição ou ordem pendente para {base_ticker}"
+        return Response({"detail": msg}, status=status.HTTP_409_CONFLICT)
+    return None
+
+
 def _parse_mt5_order_response(mt5_response: MT5Response | None):
     """
     Padroniza leitura de retcode/order_ticket e prepara detalhes para log/retorno.
@@ -1389,6 +1426,10 @@ def mt5_compra_validar(request, cliente_id: int):
     if tp is None:
         return Response({"detail": "TP (alvo) é obrigatório"}, status=400)
 
+    conflict = _position_conflict_response(cliente, ticker_base)
+    if conflict:
+        return conflict
+
     mt5 = MT5Client(ip)
     base_info = mt5.simbolo(ticker_base)
     frac_ticker = f"{ticker_base}F"
@@ -1535,6 +1576,10 @@ def mt5_compra(request, cliente_id: int):
     if tp is None:
         return Response({"detail": "TP (alvo) é obrigatório"}, status=400)
 
+    conflict = _position_conflict_response(cliente, ticker_base)
+    if conflict:
+        return conflict
+
     mt5 = MT5Client(ip)
     group_id = uuid4()
 
@@ -1675,6 +1720,18 @@ def mt5_compra(request, cliente_id: int):
 
         results.append(result_entry)
 
+    any_success = any(r.get("status") == "enviada" for r in results)
+    if not any_success and placeholder_op:
+        try:
+            MT5Order.objects.filter(group_id=group_id).update(request_id=None)
+        except Exception:
+            pass
+        try:
+            placeholder_op.delete()
+        except Exception:
+            pass
+        placeholder_op = None
+
     response_payload = {
         "group_id": str(group_id),
         "results": results,
@@ -1719,23 +1776,32 @@ def mt5_compra_status(request, cliente_id: int, group_id):
     fim_epoch = int((agora + timedelta(minutes=5)).timestamp())
 
     deals_resp = mt5.historico_deals(inicio=inicio_epoch, fim=fim_epoch)
-    deals_by_order = {}
+    deals_by_order: dict[int, list] = {}
+    deals_by_symbol: dict[str, list] = {}
     if deals_resp.ok and isinstance(deals_resp.data, list):
         for d in deals_resp.data:
-            try:
-                order_id = int(d.get("order")) if isinstance(d, dict) else None
-            except Exception:
-                order_id = None
-            if not order_id:
-                continue
-            deals_by_order.setdefault(order_id, []).append(d)
+            order_id = None
+            symbol_key = None
+            if isinstance(d, dict):
+                try:
+                    order_id = int(d.get("order")) if d.get("order") else None
+                except Exception:
+                    order_id = None
+                symbol_key = d.get("symbol") or None
+            if order_id:
+                deals_by_order.setdefault(order_id, []).append(d)
+            if symbol_key:
+                deals_by_symbol.setdefault(symbol_key, []).append(d)
 
     # atualiza status local e consolida volumes
     executed_all = True
     summary = []
     for o in orders:
         o_status = o.status
-        order_deals = deals_by_order.get(int(o.order_ticket or 0), [])
+        order_id_key = _coerce_int(o.order_ticket)
+        order_deals = deals_by_order.get(order_id_key or 0, [])
+        if not order_deals:
+            order_deals = deals_by_symbol.get(o.symbol, [])
         vol_exec = 0.0
         vwap_num = 0.0
         for d in order_deals:
@@ -2109,16 +2175,22 @@ def mt5_venda_status(request, cliente_id: int, group_id):
     fim_epoch = int((agora + timedelta(minutes=5)).timestamp())
 
     deals_resp = mt5.historico_deals(inicio=inicio_epoch, fim=fim_epoch)
-    deals_by_order = {}
+    deals_by_order: dict[int, list] = {}
+    deals_by_symbol: dict[str, list] = {}
     if deals_resp.ok and isinstance(deals_resp.data, list):
         for d in deals_resp.data:
-            try:
-                order_id = int(d.get("order")) if isinstance(d, dict) else None
-            except Exception:
-                order_id = None
-            if not order_id:
-                continue
-            deals_by_order.setdefault(order_id, []).append(d)
+            order_id = None
+            symbol_key = None
+            if isinstance(d, dict):
+                try:
+                    order_id = int(d.get("order")) if d.get("order") else None
+                except Exception:
+                    order_id = None
+                symbol_key = d.get("symbol") or None
+            if order_id:
+                deals_by_order.setdefault(order_id, []).append(d)
+            if symbol_key:
+                deals_by_symbol.setdefault(symbol_key, []).append(d)
 
     executed_all = True
     summary = []
@@ -2128,7 +2200,10 @@ def mt5_venda_status(request, cliente_id: int, group_id):
 
     for o in orders:
         o_status = o.status
-        order_deals = deals_by_order.get(int(o.order_ticket or 0), [])
+        order_id_key = _coerce_int(o.order_ticket)
+        order_deals = deals_by_order.get(order_id_key or 0, [])
+        if not order_deals:
+            order_deals = deals_by_symbol.get(o.symbol, [])
         vol_exec = 0.0
         vwap_num = 0.0
         for d in order_deals:
