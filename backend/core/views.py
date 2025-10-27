@@ -48,10 +48,146 @@ from .serializers import (
     OperacaoCarteiraSerializer,
     AcaoSerializer,
 )
-from .mt5_client import MT5Client
+from .mt5_client import MT5Client, MT5Response
 from uuid import uuid4
 from datetime import datetime, timedelta
 from django.utils.dateparse import parse_datetime
+
+
+MT5_SUCCESS_RETCODES = {10008, 10009, 10010}
+MT5_TP_RETRY_RETCODES = {10016, 10032}
+MT5_RETCODE_MESSAGES = {
+    10004: "Ordem rejeitada pelo servidor",
+    10006: "Negociação desabilitada para o símbolo",
+    10016: "Stops inválidos para a ordem",
+    10030: "Volume inválido para a ordem",
+    10031: "Preço inválido para a ordem",
+    10032: "Stop loss ou take profit inválido",
+    10033: "Volume insuficiente para execução",
+    10034: "Mercado fechado para o símbolo",
+}
+
+
+def _mt5_order_success(retcode: int | None, order_ticket: int | None) -> bool:
+    """
+    Considera sucesso quando o retcode está entre os códigos de aceite da corretora.
+    Caso o retcode venha vazio, garante que ao menos há um order_ticket válido.
+    """
+    if retcode is None:
+        return bool(order_ticket)
+    return retcode in MT5_SUCCESS_RETCODES
+
+
+def _mt5_error_detail(
+    *,
+    retcode: int | None,
+    response_json,
+    fallback_error: str | None,
+    http_status: int | None = None,
+) -> str:
+    """
+    Gera uma mensagem humana consolidando retcode + informações retornadas pelo MT5.
+    """
+    pieces: list[str] = []
+    if retcode and retcode in MT5_RETCODE_MESSAGES:
+        pieces.append(MT5_RETCODE_MESSAGES[retcode])
+
+    if isinstance(response_json, dict):
+        for key in ("error", "detail", "message", "comment", "retcode_description"):
+            val = response_json.get(key)
+            if val:
+                pieces.append(str(val))
+        # Alguns gateways retornam lista de erros em `errors`
+        errors = response_json.get("errors")
+        if isinstance(errors, (list, tuple)):
+            pieces.extend(str(e) for e in errors if e)
+    elif isinstance(response_json, str) and response_json.strip():
+        pieces.append(response_json.strip())
+
+    if fallback_error:
+        pieces.append(str(fallback_error))
+
+    parts = [p for p in (piece.strip() for piece in pieces) if p]
+    if not parts:
+        base = "Falha ao enviar ordem"
+    else:
+        # remove duplicados mantendo ordem
+        seen = set()
+        dedup = []
+        for part in parts:
+            if part not in seen:
+                dedup.append(part)
+                seen.add(part)
+        base = "; ".join(dedup)
+
+    suffix = ""
+    if retcode:
+        suffix = f" (retcode={retcode})"
+    elif http_status and http_status >= 400:
+        suffix = f" (HTTP {http_status})"
+
+    return f"{base}{suffix}"
+
+
+def _mt5_should_retry_without_tp(retcode: int | None, detail: str | None) -> bool:
+    """
+    Determina se vale a pena reenviar ordem sem TP por possível problema de stops.
+    """
+    if retcode in MT5_TP_RETRY_RETCODES:
+        return True
+    if detail:
+        lowered = detail.lower()
+        if "stop" in lowered or "tp" in lowered or "take profit" in lowered:
+            return True
+    return False
+
+
+def _coerce_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_mt5_order_response(mt5_response: MT5Response | None):
+    """
+    Padroniza leitura de retcode/order_ticket e prepara detalhes para log/retorno.
+    """
+    if mt5_response is None:
+        return False, None, None, None, "Sem resposta do servidor MT5"
+
+    response_json = (
+        mt5_response.data
+        if mt5_response.ok
+        else (mt5_response.data if mt5_response.data is not None else mt5_response.error)
+    )
+
+    order_ticket = None
+    retcode = None
+    if isinstance(response_json, dict):
+        order_ticket = _coerce_int(response_json.get("order") or response_json.get("order_ticket"))
+        retcode = _coerce_int(
+            response_json.get("retcode")
+            or response_json.get("retcode_external")
+            or response_json.get("code")
+        )
+        if retcode == 0:
+            retcode = None
+    else:
+        # quando a API retorna somente o número do ticket
+        order_ticket = _coerce_int(response_json)
+
+    success = bool(mt5_response.ok and _mt5_order_success(retcode, order_ticket))
+    detail = None
+    if not success:
+        detail = _mt5_error_detail(
+            retcode=retcode,
+            response_json=response_json,
+            fallback_error=mt5_response.error,
+            http_status=getattr(mt5_response, "status", None),
+        )
+
+    return success, order_ticket, retcode, response_json, detail
 
 
 
@@ -1455,6 +1591,7 @@ def mt5_compra(request, cliente_id: int):
             placeholder_op = None
 
     results = []
+    aggregated_errors = []
     for lg in legs:
         symbol = lg.get("symbol")
         qtd = lg.get("quantidade")
@@ -1470,52 +1607,37 @@ def mt5_compra(request, cliente_id: int):
         if execucao == "limite":
             payload["preco"] = float(preco)
 
-        # tenta enviar com TP
-        r = mt5.enviar_ordem(payload)
+        # tenta enviar com TP e aplica fallback sem TP quando houver falha por stops
         apply_tp_after_exec = False
-        response_json = None
-        order_ticket = None
-        retcode = None
+        first_response = mt5.enviar_ordem(payload)
+        success, order_ticket, retcode, response_json, error_detail = _parse_mt5_order_response(first_response)
 
-        if not r.ok:
-            # tenta reenviar sem TP se erro provável de stops
-            apply_tp_after_exec = True
-            payload.pop("tp", None)
-            r2 = mt5.enviar_ordem(payload)
-            if not r2.ok:
-                # registra como rejeitada
-                obj = MT5Order.objects.create(
-                    group_id=group_id,
-                    cliente=cliente,
-                    base_ticker=ticker_base,
-                    symbol=symbol,
-                    lado="compra",
-                    execucao=execucao,
-                    volume_req=qtd,
-                    price_req=preco if execucao == "limite" else None,
-                    tp_req=tp,
-                    apply_tp_after_exec=apply_tp_after_exec,
-                    account_login=account_login,
-                    request_id=(f"op:{placeholder_op.id}" if placeholder_op else None),
-                    status="rejeitada",
-                    response_json=str(r2.data if r2.data is not None else r2.error),
-                )
-                results.append({"symbol": symbol, "status": "rejeitada", "detail": obj.response_json})
-                continue
-            response_json = r2.data
-        else:
-            response_json = r.data
+        final_response_json = response_json
+        final_retcode = retcode
+        final_order_ticket = order_ticket
+        final_status = "enviada" if success else "rejeitada"
 
-        try:
-            order_ticket = int(response_json.get("order") or response_json.get("order_ticket") or 0)
-        except Exception:
-            order_ticket = None
-        try:
-            retcode = int(response_json.get("retcode") or 0)
-        except Exception:
-            retcode = None
+        # fallback sem TP caso necessário
+        if not success and "tp" in payload:
+            if (not first_response.ok) or _mt5_should_retry_without_tp(retcode, error_detail):
+                alt_payload = dict(payload)
+                alt_payload.pop("tp", None)
+                apply_tp_after_exec = True
+                second_response = mt5.enviar_ordem(alt_payload)
+                success2, order_ticket2, retcode2, response_json2, error_detail2 = _parse_mt5_order_response(second_response)
+                if success2:
+                    success = True
+                    final_order_ticket = order_ticket2
+                    final_retcode = retcode2
+                    final_response_json = response_json2
+                    final_status = "enviada"
+                    error_detail = None
+                else:
+                    final_retcode = retcode2 or retcode
+                    final_response_json = response_json2
+                    error_detail = error_detail2 or error_detail
 
-        MT5Order.objects.create(
+        order_record = MT5Order.objects.create(
             group_id=group_id,
             cliente=cliente,
             base_ticker=ticker_base,
@@ -1527,16 +1649,47 @@ def mt5_compra(request, cliente_id: int):
             tp_req=tp,
             apply_tp_after_exec=apply_tp_after_exec,
             account_login=account_login,
-            order_ticket=order_ticket,
-            retcode=retcode,
-            response_json=str(response_json),
+            order_ticket=final_order_ticket,
+            retcode=final_retcode,
+            response_json=str(final_response_json) if final_response_json is not None else None,
             request_id=(f"op:{placeholder_op.id}" if placeholder_op else None),
-            status="enviada",
+            status=final_status,
         )
 
-        results.append({"symbol": symbol, "order_ticket": order_ticket, "status": "enviada"})
+        result_entry = {
+            "symbol": symbol,
+            "status": final_status,
+            "order_ticket": final_order_ticket,
+            "retcode": final_retcode,
+        }
 
-    return Response({"group_id": str(group_id), "results": results})
+        if error_detail:
+            result_entry["detail"] = error_detail
+            aggregated_errors.append(
+                {
+                    "symbol": symbol,
+                    "detail": error_detail,
+                    "retcode": final_retcode,
+                }
+            )
+
+        results.append(result_entry)
+
+    response_payload = {
+        "group_id": str(group_id),
+        "results": results,
+        "has_errors": bool(aggregated_errors),
+    }
+    if aggregated_errors:
+        response_payload["errors"] = aggregated_errors
+
+    if aggregated_errors:
+        status_code = (
+            status.HTTP_400_BAD_REQUEST if len(aggregated_errors) == len(results) else status.HTTP_207_MULTI_STATUS
+        )
+    else:
+        status_code = status.HTTP_200_OK
+    return Response(response_payload, status=status_code)
 
 
 @api_view(["GET"])
@@ -1621,14 +1774,35 @@ def mt5_compra_status(request, cliente_id: int, group_id):
                 o.status = "executada"
                 o.save(update_fields=["status", "updated_at"])
             avg = (vwap_num / vol_exec) if vol_exec > 0 else None
-            summary.append({"symbol": o.symbol, "executada": True, "volume": vol_exec, "preco_medio": avg})
+            summary.append(
+                {
+                    "symbol": o.symbol,
+                    "executada": True,
+                    "volume": vol_exec,
+                    "preco_medio": avg,
+                    "status": o.status,
+                    "retcode": o.retcode,
+                }
+            )
         else:
             executed_all = False
-            new_status = "parcial" if vol_exec > 0 else "pendente"
-            if o_status != new_status:
-                o.status = new_status
-                o.save(update_fields=["status", "updated_at"])
-            summary.append({"symbol": o.symbol, "executada": False, "volume_exec": vol_exec})
+            if o_status in ("rejeitada", "cancelada"):
+                current_status = o_status
+            else:
+                current_status = "parcial" if vol_exec > 0 else "pendente"
+                if o_status != current_status:
+                    o.status = current_status
+                    o.save(update_fields=["status", "updated_at"])
+            summary_entry = {
+                "symbol": o.symbol,
+                "executada": False,
+                "volume_exec": vol_exec,
+                "status": current_status,
+                "retcode": o.retcode,
+            }
+            if current_status == "rejeitada" and o.response_json:
+                summary_entry["detail"] = o.response_json
+            summary.append(summary_entry)
 
     # quando todas executadas, cria OperacaoCarteira consolidada e aplica TP via SLTP (se necessário)
     created_operacao = None
@@ -1827,6 +2001,7 @@ def mt5_venda(request, cliente_id: int, operacao_id: int):
 
     group_id = uuid4()
     results = []
+    aggregated_errors = []
     for sym, vol in symbols_to_close:
         payload = {
             "ticker": sym,
@@ -1837,18 +2012,10 @@ def mt5_venda(request, cliente_id: int, operacao_id: int):
         if execucao == "limite":
             payload["preco"] = float(preco)
 
-        r = mt5.enviar_ordem(payload)
-        response_json = r.data if r.ok else (r.data if r.data is not None else r.error)
-        try:
-            order_ticket = int((response_json or {}).get("order") or (response_json or {}).get("order_ticket") or 0)
-        except Exception:
-            order_ticket = None
-        try:
-            retcode = int((response_json or {}).get("retcode") or 0)
-        except Exception:
-            retcode = None
+        response = mt5.enviar_ordem(payload)
+        success, order_ticket, retcode, response_json, error_detail = _parse_mt5_order_response(response)
+        status_label = "enviada" if success else "rejeitada"
 
-        status_label = "enviada" if r.ok else "rejeitada"
         MT5Order.objects.create(
             group_id=group_id,
             cliente=cliente,
@@ -1868,9 +2035,34 @@ def mt5_venda(request, cliente_id: int, operacao_id: int):
             comment=f"sell_op:{operacao.id}",
         )
 
-        results.append({"symbol": sym, "order_ticket": order_ticket, "status": status_label})
+        result_entry = {
+            "symbol": sym,
+            "order_ticket": order_ticket,
+            "status": status_label,
+            "retcode": retcode,
+        }
+        if error_detail:
+            result_entry["detail"] = error_detail
+            aggregated_errors.append({"symbol": sym, "detail": error_detail, "retcode": retcode})
 
-    return Response({"group_id": str(group_id), "results": results})
+        results.append(result_entry)
+
+    response_payload = {
+        "group_id": str(group_id),
+        "results": results,
+        "has_errors": bool(aggregated_errors),
+    }
+    if aggregated_errors:
+        response_payload["errors"] = aggregated_errors
+
+    if aggregated_errors:
+        status_code = (
+            status.HTTP_400_BAD_REQUEST if len(aggregated_errors) == len(results) else status.HTTP_207_MULTI_STATUS
+        )
+    else:
+        status_code = status.HTTP_200_OK
+
+    return Response(response_payload, status=status_code)
 
 
 @api_view(["GET"])
@@ -1957,13 +2149,35 @@ def mt5_venda_status(request, cliente_id: int, group_id):
                 o.status = "executada"
                 o.save(update_fields=["status", "updated_at"])
             avg = (vwap_num / vol_exec) if vol_exec > 0 else None
-            summary.append({"symbol": o.symbol, "executada": True, "volume": vol_exec, "preco_medio": avg})
+            summary.append(
+                {
+                    "symbol": o.symbol,
+                    "executada": True,
+                    "volume": vol_exec,
+                    "preco_medio": avg,
+                    "status": o.status,
+                    "retcode": o.retcode,
+                }
+            )
         else:
             executed_all = False
-            if o_status != "pendente":
-                o.status = "pendente"
-                o.save(update_fields=["status", "updated_at"])
-            summary.append({"symbol": o.symbol, "executada": False, "volume_exec": vol_exec})
+            if o_status in ("rejeitada", "cancelada"):
+                current_status = o_status
+            else:
+                current_status = "pendente"
+                if o_status != current_status:
+                    o.status = current_status
+                    o.save(update_fields=["status", "updated_at"])
+            summary_entry = {
+                "symbol": o.symbol,
+                "executada": False,
+                "volume_exec": vol_exec,
+                "status": current_status,
+                "retcode": o.retcode,
+            }
+            if current_status == "rejeitada" and o.response_json:
+                summary_entry["detail"] = o.response_json
+            summary.append(summary_entry)
 
         vwap_num_total += vwap_num
         vol_total_exec += vol_exec
