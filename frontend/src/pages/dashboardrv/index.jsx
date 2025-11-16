@@ -17,8 +17,10 @@ import {
   Button,
 } from "@mui/material";
 import { Chip } from "@mui/material";
+import * as XLSX from "xlsx";
 import api from "../../services/api";
 import { useNavigate } from "react-router-dom";
+import OperacaoModal from "../../components/OperacaoModal";
 
 // --- helpers de ordenação ---
 function descendingComparator(a, b, orderBy) {
@@ -73,6 +75,11 @@ export default function DashboardRV() {
   const [recs, setRecs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [qtdPosicionadasByCliente, setQtdPosicionadasByCliente] = useState({});
+  const [acoesDisponiveis, setAcoesDisponiveis] = useState([]);
+  const [operacaoModalOpen, setOperacaoModalOpen] = useState(false);
+  const [operacaoSelecionada, setOperacaoSelecionada] = useState(null);
+  const [operacaoCliente, setOperacaoCliente] = useState({ id: null, nome: "" });
+  const [operacaoCarregandoId, setOperacaoCarregandoId] = useState(null);
 
   // filtros
   const [filtroCliente, setFiltroCliente] = useState("");
@@ -81,11 +88,25 @@ export default function DashboardRV() {
   // sort
   const [order, setOrder] = useState("asc");
   const [orderBy, setOrderBy] = useState("cliente");
+  const [orderPat, setOrderPat] = useState("asc");
+  const [orderByPat, setOrderByPat] = useState("codigo");
+  const [orderRec, setOrderRec] = useState("asc");
+  const [orderByRec, setOrderByRec] = useState("ticker");
 
   const handleRequestSort = (property) => {
     const isAsc = orderBy === property && order === "asc";
     setOrder(isAsc ? "desc" : "asc");
     setOrderBy(property);
+  };
+  const handleRequestSortPatrimonio = (property) => {
+    const isAsc = orderByPat === property && orderPat === "asc";
+    setOrderPat(isAsc ? "desc" : "asc");
+    setOrderByPat(property);
+  };
+  const handleRequestSortRecs = (property) => {
+    const isAsc = orderByRec === property && orderRec === "asc";
+    setOrderRec(isAsc ? "desc" : "asc");
+    setOrderByRec(property);
   };
 
   const fetchDashboard = async () => {
@@ -108,6 +129,18 @@ export default function DashboardRV() {
     fetchDashboard();
   }, []);
 
+  useEffect(() => {
+    const loadAcoes = async () => {
+      try {
+        const lista = await api("acoes/");
+        setAcoesDisponiveis(lista || []);
+      } catch (e) {
+        console.error("Erro ao carregar ações:", e);
+      }
+    };
+    loadAcoes();
+  }, []);
+
   // carrega quantidade total de ações posicionadas por cliente
   useEffect(() => {
     const loadQtdPosicionadas = async () => {
@@ -121,8 +154,17 @@ export default function DashboardRV() {
           try {
             const res = await api(`operacoes/?cliente=${id}`);
             const lista = res?.results || res || [];
-            const soma = lista.filter((op) => !op.data_venda).reduce((acc, op) => acc + (Number(op.quantidade) || 0), 0);
-            return [id, soma];
+            const abertos = lista.filter((op) => !op.data_venda);
+            const symbols = new Set(
+              abertos
+                .map((op) => {
+                  const raw = op.acao_nome ?? op.acao ?? op.ticker ?? op.symbol;
+                  if (raw == null) return null;
+                  return String(raw).trim().toUpperCase();
+                })
+                .filter(Boolean)
+            );
+            return [id, symbols.size];
           } catch (e) {
             return [id, 0];
           }
@@ -172,6 +214,43 @@ export default function DashboardRV() {
     return <Chip size="small" label={label} color={color} variant={label==='n/d' ? 'outlined' : 'filled'} />;
   };
 
+  const closeOperacaoModal = () => {
+    setOperacaoModalOpen(false);
+    setOperacaoSelecionada(null);
+    setOperacaoCliente({ id: null, nome: "" });
+  };
+
+  const abrirEdicaoPosicao = async (op) => {
+    if (!op?.id) return;
+    setOperacaoCarregandoId(op.id);
+    try {
+      const detalhe = await api(`operacoes/${op.id}/`);
+      const hojeISO = new Date().toISOString().slice(0, 10);
+      const payload = {
+        ...detalhe,
+        data_venda: detalhe?.data_venda || hojeISO,
+        preco_venda_unitario:
+          detalhe?.preco_venda_unitario != null
+            ? detalhe.preco_venda_unitario
+            : detalhe?.valor_alvo ?? "",
+      };
+      setOperacaoSelecionada(payload);
+      setOperacaoCliente({
+        id: detalhe?.cliente ?? op.cliente_id ?? null,
+        nome: op.cliente ?? "",
+      });
+      setOperacaoModalOpen(true);
+    } catch (err) {
+      console.error("Erro ao carregar operação:", err);
+    } finally {
+      setOperacaoCarregandoId(null);
+    }
+  };
+
+  const handleAfterSaveOperacao = async () => {
+    await fetchDashboard();
+  };
+
   const LoadingModal = () => (
     <Modal open={loading}>
       <Box
@@ -188,6 +267,55 @@ export default function DashboardRV() {
     </Modal>
   );
 
+  const patrimonioRows = (patrimonio || []).map((cli) => ({
+    ...cli,
+    qtd_acoes: qtdPosicionadasByCliente[cli.codigo] ?? 0,
+  }));
+  const sortedPatrimonio = stableSort(patrimonioRows, getComparator(orderPat, orderByPat));
+  const recColumns = [
+    { id: "ticker", label: "Ticker" },
+    { id: "empresa", label: "Empresa" },
+    { id: "setor", label: "Setor" },
+    { id: "data", label: "Data" },
+    { id: "preco_compra", label: "Preço compra", type: "currency" },
+    { id: "alvo_sugerido", label: "Alvo sugerido", type: "currency" },
+    { id: "percentual_estimado", label: "% Estimado", type: "percent" },
+    { id: "probabilidade", label: "Probabilidade", type: "percent" },
+    { id: "vezes_atingiu_alvo_1m", label: "Vezes alvo 1m", type: "number" },
+    { id: "cruza_medias", label: "Cruza médias", type: "bool" },
+    { id: "obv_cres", label: "OBV ↑", type: "bool" },
+    { id: "vol_acima_media", label: "Volume ↑", type: "bool" },
+    { id: "wma602", label: "WMA602", type: "currency" },
+    { id: "MIN", label: "MIN", type: "currency" },
+    { id: "MAX", label: "MAX", type: "currency" },
+    { id: "AMPLITUDE", label: "AMPLITUDE", type: "currency" },
+    { id: "AMP_AxF", label: "AMP A×F", type: "currency" },
+    { id: "AMP_MXxMN", label: "AMP MX×MN", type: "currency" },
+    { id: "A_x_F", label: "A×F", type: "currency" },
+    { id: "ALVO", label: "ALVO", type: "currency" },
+    { id: "ALTA", label: "ALTA", type: "currency" },
+    { id: "BAIXA", label: "BAIXA", type: "currency" },
+  ];
+  const formatRecCell = (row, col) => {
+    const value = row?.[col.id];
+    if (value == null || value === "") {
+      return "-";
+    }
+    switch (col.type) {
+      case "currency":
+        return formatCurrencyBRL(value);
+      case "percent":
+        return formatPercentBR(value);
+      case "bool":
+        return value ? "✅" : "❌";
+      case "number":
+        return value;
+      default:
+        return value;
+    }
+  };
+  const sortedRecs = stableSort(recs || [], getComparator(orderRec, orderByRec));
+
   // --- gera listas únicas de clientes e ações
   const clientesUnicos = [...new Set(posicionadas.map((p) => p.cliente))];
   const acoesUnicas = [...new Set(posicionadas.map((p) => p.acao))];
@@ -198,10 +326,68 @@ export default function DashboardRV() {
     const matchAcao = filtroAcao ? op.acao === filtroAcao : true;
     return matchCliente && matchAcao;
   });
+  const sortedPosicionadas = stableSort(
+    posicionadasFiltradas,
+    getComparator(order, orderBy)
+  );
 
   const limparFiltros = () => {
     setFiltroCliente("");
     setFiltroAcao("");
+  };
+
+  const exportPosicionadasXls = () => {
+    if (!sortedPosicionadas.length) return;
+
+    const headers = [
+      "Cliente",
+      "Ação",
+      "Data Compra",
+      "Preço Unitário",
+      "Quantidade",
+      "Valor Total Compra",
+      "Preço Atual",
+      "Máxima (dia)",
+      "Mínima (dia)",
+      "Variação (%)",
+      "Valor Alvo",
+      "Dias Posicionado",
+      "Status",
+    ];
+
+    const linhas = sortedPosicionadas.map((op) => [
+      op.cliente ?? "-",
+      op.acao ?? "-",
+      op.data_compra ?? "-",
+      formatCurrencyBRL(op.preco_compra),
+      op.quantidade ?? "-",
+      formatCurrencyBRL(op.valor_total_compra),
+      formatCurrencyBRL(op.preco_atual),
+      formatCurrencyBRL(op.preco_max),
+      formatCurrencyBRL(op.preco_min),
+      formatPercentBR(op.lucro_percentual),
+      formatCurrencyBRL(op.valor_alvo),
+      op.dias_posicionado ?? "-",
+      statusById[op.id] || "n/d",
+    ]);
+
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...linhas]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Posicionadas");
+    const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+
+    const blob = new Blob([wbout], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    link.download = `posicionadas_${stamp}.xlsx`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -273,14 +459,14 @@ export default function DashboardRV() {
               </Button>
             )}
 
-            <Button
-              variant="contained"
-              color="primary"
-              onClick={fetchDashboard}
-              sx={{ ml: "auto" }}
-            >
-              🔄 Atualizar
-            </Button>
+            <Box sx={{ display: "flex", gap: 1, ml: "auto" }}>
+              <Button variant="outlined" color="primary" onClick={exportPosicionadasXls}>
+                ⬇ Exportar Excel
+              </Button>
+              <Button variant="contained" color="primary" onClick={fetchDashboard}>
+                🔄 Atualizar
+              </Button>
+            </Box>
           </Box>
 
           <Table>
@@ -294,6 +480,8 @@ export default function DashboardRV() {
                   { id: "quantidade", label: "Quantidade" },
                   { id: "valor_total_compra", label: "Valor Total Compra" },
                   { id: "preco_atual", label: "Preço Atual" },
+                  { id: "preco_max", label: "Máxima (dia)" },
+                  { id: "preco_min", label: "Mínima (dia)" },
                   { id: "lucro_percentual", label: "Variação (%)" },
                   { id: "valor_alvo", label: "Valor Alvo" },
                   { id: "dias_posicionado", label: "Dias Posicionado" },
@@ -309,20 +497,43 @@ export default function DashboardRV() {
                   </TableCell>
                 ))}
                 <TableCell>Status</TableCell>
+                <TableCell>Ações</TableCell>
               </TableRow>
             </TableHead>
 
             <TableBody>
-              {stableSort(posicionadasFiltradas, getComparator(order, orderBy)).map(
-                (op) => (
+              {sortedPosicionadas.map((op) => {
+                const precoMax = op.preco_max != null ? Number(op.preco_max) : null;
+                const precoMin = op.preco_min != null ? Number(op.preco_min) : null;
+                const precoAtual = op.preco_atual != null ? Number(op.preco_atual) : null;
+                const valorAlvo = op.valor_alvo != null ? Number(op.valor_alvo) : null;
+                const atingiuAlvo =
+                  valorAlvo != null && precoMax != null && precoMin != null &&
+                  valorAlvo >= precoMin && valorAlvo <= precoMax;
+
+                return (
                   <TableRow key={op.id}>
-                    <TableCell>{op.cliente}</TableCell>
+                    <TableCell>
+                      {op.cliente_id ? (
+                        <Button
+                          variant="text"
+                          size="small"
+                          onClick={() => navigate(`/clientes/${op.cliente_id}/carteira`)}
+                        >
+                          {op.cliente}
+                        </Button>
+                      ) : (
+                        op.cliente
+                      )}
+                    </TableCell>
                     <TableCell>{op.acao}</TableCell>
                     <TableCell>{op.data_compra ?? "-"}</TableCell>
                     <TableCell>{formatCurrencyBRL(op.preco_compra)}</TableCell>
                     <TableCell>{op.quantidade ?? "-"}</TableCell>
                     <TableCell>{formatCurrencyBRL(op.valor_total_compra)}</TableCell>
-                    <TableCell>{formatCurrencyBRL(op.preco_atual)}</TableCell>
+                    <TableCell>{formatCurrencyBRL(precoAtual)}</TableCell>
+                    <TableCell>{formatCurrencyBRL(precoMax)}</TableCell>
+                    <TableCell>{formatCurrencyBRL(precoMin)}</TableCell>
                     <TableCell
                       sx={{
                         color: (op.lucro_percentual ?? 0) >= 0 ? "green" : "red",
@@ -330,12 +541,31 @@ export default function DashboardRV() {
                     >
                       {formatPercentBR(op.lucro_percentual)}
                     </TableCell>
-                    <TableCell>{formatCurrencyBRL(op.valor_alvo)}</TableCell>
-                  <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
+                    <TableCell
+                      sx={{
+                        backgroundColor: atingiuAlvo
+                          ? "rgba(252, 210, 0, 0.35)"
+                          : "inherit",
+                        fontWeight: atingiuAlvo ? 600 : "normal",
+                      }}
+                    >
+                      {formatCurrencyBRL(valorAlvo)}
+                    </TableCell>
+                    <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
                     <TableCell>{renderStatusChip(statusById[op.id] || 'n/d')}</TableCell>
-                </TableRow>
-              )
-            )}
+                    <TableCell>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => abrirEdicaoPosicao(op)}
+                        disabled={operacaoCarregandoId === op.id}
+                      >
+                        {operacaoCarregandoId === op.id ? "Abrindo..." : "Editar"}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </>
@@ -346,29 +576,76 @@ export default function DashboardRV() {
         <Table>
           <TableHead>
             <TableRow>
-              <TableCell>Código</TableCell>
-              <TableCell>Nome</TableCell>
-              <TableCell>Patrimônio</TableCell>
-              <TableCell>Total Consolidado</TableCell>
-              <TableCell>Valor Disponível</TableCell>
-              <TableCell>Qtd Ações</TableCell>
-              <TableCell>Ações</TableCell>
+              <TableCell sortDirection={orderByPat === "codigo" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "codigo"}
+                  direction={orderByPat === "codigo" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("codigo")}
+                >
+                  Código
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderByPat === "nome" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "nome"}
+                  direction={orderByPat === "nome" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("nome")}
+                >
+                  Nome
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderByPat === "patrimonio" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "patrimonio"}
+                  direction={orderByPat === "patrimonio" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("patrimonio")}
+                >
+                  Patrimônio
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderByPat === "total_consolidado" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "total_consolidado"}
+                  direction={orderByPat === "total_consolidado" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("total_consolidado")}
+                >
+                  Total Consolidado
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderByPat === "valor_disponivel" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "valor_disponivel"}
+                  direction={orderByPat === "valor_disponivel" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("valor_disponivel")}
+                >
+                  Valor Disponível
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderByPat === "qtd_acoes" ? orderPat : false}>
+                <TableSortLabel
+                  active={orderByPat === "qtd_acoes"}
+                  direction={orderByPat === "qtd_acoes" ? orderPat : "asc"}
+                  onClick={() => handleRequestSortPatrimonio("qtd_acoes")}
+                >
+                  Qtd Ações
+                </TableSortLabel>
+              </TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {patrimonio.map((cli) => (
-              <TableRow key={cli.codigo}>
+            {sortedPatrimonio.map((cli) => (
+              <TableRow
+                key={cli.codigo}
+                hover
+                onClick={() => navigate(`/clientes/${cli.codigo}/carteira`)}
+                sx={{ cursor: "pointer" }}
+              >
                 <TableCell>{cli.codigo}</TableCell>
                 <TableCell>{cli.nome}</TableCell>
                 <TableCell>{formatCurrencyBRL(cli.patrimonio)}</TableCell>
                 <TableCell>{formatCurrencyBRL(cli.total_consolidado)}</TableCell>
                 <TableCell>{formatCurrencyBRL(cli.valor_disponivel)}</TableCell>
-                <TableCell>{qtdPosicionadasByCliente[cli.codigo] ?? '-'}</TableCell>
-                <TableCell>
-                  <Button size="small" variant="contained" onClick={() => navigate(`/clientes/${cli.codigo}/carteira`)}>
-                    Abrir Carteira
-                  </Button>
-                </TableCell>
+                <TableCell>{cli.qtd_acoes ?? '-'}</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -404,66 +681,35 @@ export default function DashboardRV() {
         <Table>
           <TableHead>
             <TableRow>
-              {[
-                "Ticker",
-                "Empresa",
-                "Setor",
-                "Data",
-                "Preço compra",
-                "Alvo sugerido",
-                "% Estimado",
-                "Probabilidade",
-                "Vezes alvo 1m",
-                "Cruza médias",
-                "OBV ↑",
-                "Volume ↑",
-                "WMA602",
-                "MIN",
-                "MAX",
-                "AMPLITUDE",
-                "AMP A×F",
-                "AMP MX×MN",
-                "A×F",
-                "ALVO",
-                "ALTA",
-                "BAIXA",
-              ].map((h, idx) => (
-                <TableCell key={idx}>{h}</TableCell>
+              {recColumns.map((col) => (
+                <TableCell
+                  key={col.id}
+                  sortDirection={orderByRec === col.id ? orderRec : false}
+                >
+                  <TableSortLabel
+                    active={orderByRec === col.id}
+                    direction={orderByRec === col.id ? orderRec : "asc"}
+                    onClick={() => handleRequestSortRecs(col.id)}
+                  >
+                    {col.label}
+                  </TableSortLabel>
+                </TableCell>
               ))}
             </TableRow>
           </TableHead>
 
           <TableBody>
-            {recs.length ? (
-              recs.map((r, i) => (
+            {sortedRecs.length ? (
+              sortedRecs.map((r, i) => (
                 <TableRow key={i}>
-                  <TableCell>{r.ticker}</TableCell>
-                  <TableCell>{r.empresa}</TableCell>
-                  <TableCell>{r.setor}</TableCell>
-                  <TableCell>{r.data}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.preco_compra)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.alvo_sugerido)}</TableCell>
-                  <TableCell>{formatPercentBR(r.percentual_estimado)}</TableCell>
-                  <TableCell>{formatPercentBR(r.probabilidade)}</TableCell>
-                  <TableCell>{r.vezes_atingiu_alvo_1m}</TableCell>
-                  <TableCell>{r.cruza_medias ? "✅" : "❌"}</TableCell>
-                  <TableCell>{r.obv_cres ? "✅" : "❌"}</TableCell>
-                  <TableCell>{r.vol_acima_media ? "✅" : "❌"}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.wma602)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.MIN)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.MAX)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.AMPLITUDE)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.AMP_AxF)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.AMP_MXxMN)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.A_x_F)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.ALVO)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.ALTA)}</TableCell>
-                  <TableCell>{formatCurrencyBRL(r.BAIXA)}</TableCell>
+                  {recColumns.map((col) => (
+                    <TableCell key={col.id}>{formatRecCell(r, col)}</TableCell>
+                  ))}
                 </TableRow>
               ))
             ) : (
               <TableRow>
-                <TableCell colSpan={22} align="center">
+                <TableCell colSpan={recColumns.length} align="center">
                   Nenhuma recomendação encontrada.
                 </TableCell>
               </TableRow>
@@ -473,6 +719,16 @@ export default function DashboardRV() {
         </Box>
       </Box>
     )}
+
+      <OperacaoModal
+        open={operacaoModalOpen}
+        onClose={closeOperacaoModal}
+        operacao={operacaoSelecionada}
+        clienteId={operacaoCliente.id}
+        clienteNome={operacaoCliente.nome}
+        acoes={acoesDisponiveis}
+        onAfterSave={handleAfterSaveOperacao}
+      />
 
     </Box>
   );

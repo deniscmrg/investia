@@ -14,6 +14,7 @@ import {
   TableBody,
   TableRow,
   TableCell,
+  TableSortLabel,
   TextField,
   Dialog,
   DialogTitle,
@@ -38,6 +39,8 @@ export default function Clientes() {
   const [VMPrivateIP, setVMPrivateIP] = useState("");
   const [percentualPatrimonio, setPercentualPatrimonio] = useState(""); // NOVO
   const [mt5Status, setMt5Status] = useState({});
+  const [order, setOrder] = useState("asc");
+  const [orderBy, setOrderBy] = useState("nome");
 
   const statusLabels = {
     online: "MT5 conectado",
@@ -75,6 +78,63 @@ export default function Clientes() {
         : "";
     const detail = item.detail ? ` • ${item.detail}` : "";
     return `${base}${detail}${pingInfo}`;
+  };
+
+  const getStatusSortValue = (cliente) => {
+    const info = mt5Status?.[cliente.id];
+    return info?.status ? String(info.status).toUpperCase() : "";
+  };
+  const getSortValue = (cliente, property) => {
+    switch (property) {
+      case "percentual_patrimonio":
+        return cliente?.percentual_patrimonio != null
+          ? Number(cliente.percentual_patrimonio)
+          : null;
+      case "codigo_xp": {
+        const value = cliente?.codigo_xp;
+        if (value == null || value === "") return "";
+        const numeric = Number(value);
+        return Number.isNaN(numeric) ? String(value).toUpperCase() : numeric;
+      }
+      case "status":
+        return getStatusSortValue(cliente);
+      default: {
+        const value = cliente?.[property];
+        if (value == null || value === "") return "";
+        if (typeof value === "number") return value;
+        return String(value).toUpperCase();
+      }
+    }
+  };
+  const descendingComparator = (a, b, property) => {
+    const av = getSortValue(a, property);
+    const bv = getSortValue(b, property);
+    if ((av === "" || av == null) && (bv === "" || bv == null)) return 0;
+    if (av === "" || av == null) return 1;
+    if (bv === "" || bv == null) return -1;
+    if (typeof av === "number" && typeof bv === "number") return bv - av;
+    return String(bv).localeCompare(String(av), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+  };
+  const getComparator = (sortOrder, property) =>
+    sortOrder === "desc"
+      ? (a, b) => descendingComparator(a, b, property)
+      : (a, b) => -descendingComparator(a, b, property);
+  const stableSort = (array, comparator) => {
+    const stabilized = (array || []).map((el, index) => [el, index]);
+    stabilized.sort((a, b) => {
+      const cmp = comparator(a[0], b[0]);
+      if (cmp !== 0) return cmp;
+      return a[1] - b[1];
+    });
+    return stabilized.map((el) => el[0]);
+  };
+  const handleRequestSort = (property) => {
+    const isAsc = orderBy === property && order === "asc";
+    setOrder(isAsc ? "desc" : "asc");
+    setOrderBy(property);
   };
 
   const fetchClientes = async () => {
@@ -190,6 +250,8 @@ export default function Clientes() {
     setPercentualPatrimonio(""); // NOVO
   };
 
+  const sortedClientes = stableSort(clientes, getComparator(order, orderBy));
+
   return (
     <Box sx={{ mt: 12, px: 4 }}>
       <Typography variant="h4" mb={2}>
@@ -205,21 +267,101 @@ export default function Clientes() {
       <Table>
         <TableHead>
           <TableRow>
-            <TableCell>Nome</TableCell>
-            <TableCell>Email</TableCell>
-            <TableCell>Documento</TableCell>
-            <TableCell>Telefone</TableCell>
-            <TableCell>Código XP</TableCell>
-            <TableCell>% Patrimônio</TableCell>
-            <TableCell>VM Nome</TableCell>
-            <TableCell>VM IP</TableCell>
-            <TableCell>VM IP Privado</TableCell>
-            <TableCell>Status MT5</TableCell>
+            <TableCell sortDirection={orderBy === "nome" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "nome"}
+                direction={orderBy === "nome" ? order : "asc"}
+                onClick={() => handleRequestSort("nome")}
+              >
+                Nome
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "email" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "email"}
+                direction={orderBy === "email" ? order : "asc"}
+                onClick={() => handleRequestSort("email")}
+              >
+                Email
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "documento" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "documento"}
+                direction={orderBy === "documento" ? order : "asc"}
+                onClick={() => handleRequestSort("documento")}
+              >
+                Documento
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "telefone" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "telefone"}
+                direction={orderBy === "telefone" ? order : "asc"}
+                onClick={() => handleRequestSort("telefone")}
+              >
+                Telefone
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "codigo_xp" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "codigo_xp"}
+                direction={orderBy === "codigo_xp" ? order : "asc"}
+                onClick={() => handleRequestSort("codigo_xp")}
+              >
+                Código XP
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "percentual_patrimonio" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "percentual_patrimonio"}
+                direction={orderBy === "percentual_patrimonio" ? order : "asc"}
+                onClick={() => handleRequestSort("percentual_patrimonio")}
+              >
+                % Patrimônio
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "vm" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "vm"}
+                direction={orderBy === "vm" ? order : "asc"}
+                onClick={() => handleRequestSort("vm")}
+              >
+                VM Nome
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "vm_ip" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "vm_ip"}
+                direction={orderBy === "vm_ip" ? order : "asc"}
+                onClick={() => handleRequestSort("vm_ip")}
+              >
+                VM IP
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "vm_private_ip" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "vm_private_ip"}
+                direction={orderBy === "vm_private_ip" ? order : "asc"}
+                onClick={() => handleRequestSort("vm_private_ip")}
+              >
+                VM IP Privado
+              </TableSortLabel>
+            </TableCell>
+            <TableCell sortDirection={orderBy === "status" ? order : false}>
+              <TableSortLabel
+                active={orderBy === "status"}
+                direction={orderBy === "status" ? order : "asc"}
+                onClick={() => handleRequestSort("status")}
+              >
+                Status MT5
+              </TableSortLabel>
+            </TableCell>
             <TableCell>Ações</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
-          {clientes.map((c) => (
+          {sortedClientes.map((c) => (
             <TableRow key={c.id}>
               <TableCell>{c.nome}</TableCell>
               <TableCell>{c.email}</TableCell>

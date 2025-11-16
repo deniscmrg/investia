@@ -4,13 +4,16 @@ import io
 import json
 import re
 from decimal import Decimal, InvalidOperation
+import math
 
 from django.db.models import Sum, F, ExpressionWrapper, DecimalField
 from django.http import JsonResponse
 
 import yfinance as yf
+import pandas as pd
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from django.core.management import call_command
 from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
@@ -24,7 +27,6 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 from datetime import date
 
-import subprocess
 import sys
 import os
 import requests
@@ -66,6 +68,61 @@ MT5_RETCODE_MESSAGES = {
     10033: "Volume insuficiente para execução",
     10034: "Mercado fechado para o símbolo",
 }
+
+BCB_SERIES = {
+    "ipca": {
+        "series": 13522,
+        "label": "IPCA (12 meses)",
+        "description": "IPCA acumulado em 12 meses (IBGE)",
+    },
+    "igpm": {
+        "series": 189,
+        "label": "IGP-M (12 meses)",
+        "description": "IGP-M acumulado em 12 meses (FGV)",
+    },
+    "selic": {
+        "series": 432,
+        "label": "SELIC",
+        "description": "Taxa Selic Meta (BCB)",
+    },
+}
+
+
+def _finite_float(value):
+    """Converte para float retornando None quando não for número finito."""
+    if value is None:
+        return None
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(val) or math.isinf(val):
+        return None
+    return val
+
+
+def _fetch_bcb_series_latest(series_id: int) -> tuple[float | None, str | None]:
+    """
+    Busca o último valor disponível de uma série do Banco Central (SGS).
+    Retorna (valor_float, data_str) ou (None, None) em caso de falha.
+    """
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados/ultimos/1?formato=json"
+    try:
+        resp = requests.get(url, timeout=5)
+        if not resp.ok:
+            return None, None
+        data = resp.json()
+        if not isinstance(data, list) or not data:
+            return None, None
+        item = data[0]
+        raw_val = item.get("valor")
+        raw_date = item.get("data")
+        if raw_val is None:
+            return None, raw_date
+        val = float(str(raw_val).replace(",", "."))
+        return val, raw_date
+    except (requests.RequestException, ValueError, TypeError):
+        return None, None
 
 
 def _mt5_order_success(retcode: int | None, order_ticket: int | None) -> bool:
@@ -149,9 +206,6 @@ def _coerce_int(value) -> int | None:
         return None
 
 
-MT5_OPEN_ORDER_STATUSES: set[str] = {"enviada", "pendente", "parcial"}
-
-
 def _has_open_operacao(cliente: Cliente, base_ticker: str) -> bool:
     try:
         return OperacaoCarteira.objects.filter(
@@ -161,27 +215,15 @@ def _has_open_operacao(cliente: Cliente, base_ticker: str) -> bool:
         return False
 
 
-def _has_open_mt5_compra(cliente: Cliente, base_ticker: str) -> bool:
-    try:
-        return MT5Order.objects.filter(
-            cliente=cliente,
-            base_ticker=base_ticker,
-            lado="compra",
-            status__in=MT5_OPEN_ORDER_STATUSES,
-        ).exists()
-    except Exception:
-        return False
-
-
 def _position_conflict_response(cliente: Cliente, base_ticker: str):
     """
-    Verifica se já existe posição ou ordem MT5 pendente para o cliente+ticker.
+    Verifica se já existe posição da carteira aberta para o cliente+ticker.
     Retorna Response(409) quando existir conflito.
     """
     if not base_ticker:
         return None
-    if _has_open_operacao(cliente, base_ticker) or _has_open_mt5_compra(cliente, base_ticker):
-        msg = f"Cliente já possui posição ou ordem pendente para {base_ticker}"
+    if _has_open_operacao(cliente, base_ticker):
+        msg = f"Cliente já possui posição aberta para {base_ticker}"
         return Response({"detail": msg}, status=status.HTTP_409_CONFLICT)
     return None
 
@@ -410,27 +452,46 @@ class AcaoViewSet(viewsets.ReadOnlyModelViewSet):
 # Cotações helpers (MT5 first, yfinance fallback)
 # -------------------
 
-def _mt5_preco_atual(ip: str | None, base_ticker: str) -> float | None:
-    """Consulta preço atual via MT5 API do cliente. Retorna last ou ask/bid."""
+def _mt5_cotacao_info(ip: str | None, base_ticker: str) -> dict[str, float]:
+    """Retorna informações de cotação via MT5: preço, máxima e mínima."""
+    info: dict[str, float] = {}
     if not ip or not base_ticker:
-        return None
+        return info
     try:
         mt5 = MT5Client(ip)
         q = mt5.cotacao(base_ticker)
         if q.ok and isinstance(q.data, dict):
-            # prioriza last; fallback ask; por fim bid
-            last = q.data.get("last")
-            ask = q.data.get("ask")
-            bid = q.data.get("bid")
-            if last is not None:
-                return float(last)
-            if ask is not None:
-                return float(ask)
-            if bid is not None:
-                return float(bid)
+            data = q.data
+
+            def _first_float(*keys):
+                for key in keys:
+                    val = _finite_float(data.get(key))
+                    if val is not None:
+                        return val
+                return None
+
+            preco = _first_float("last", "ask", "bid", "price")
+            maxima = _first_float(
+                "high", "max", "maximum", "high_price", "highPrice", "max_price"
+            )
+            minima = _first_float(
+                "low", "min", "minimum", "low_price", "lowPrice", "min_price"
+            )
+
+            if preco is not None:
+                info["preco"] = preco
+            if maxima is not None:
+                info["max"] = maxima
+            if minima is not None:
+                info["min"] = minima
     except Exception:
-        pass
-    return None
+        info = {}
+    return info
+
+
+def _mt5_preco_atual(ip: str | None, base_ticker: str) -> float | None:
+    """Consulta preço atual via MT5 API do cliente. Retorna last ou ask/bid."""
+    return _mt5_cotacao_info(ip, base_ticker).get("preco")
 
 
 # -------------------
@@ -464,6 +525,25 @@ def cotacoes_atuais(request):
     return Response(resultado)
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def indices_economicos(request):
+    """
+    Retorna os últimos valores de IPCA, IGP-M e taxa Selic (usada como proxy para SEFIP).
+    Fonte: Banco Central do Brasil (API SGS).
+    """
+    payload = {}
+    for key, meta in BCB_SERIES.items():
+        valor, data_ref = _fetch_bcb_series_latest(meta["series"])
+        payload[key] = {
+            "label": meta["label"],
+            "description": meta["description"],
+            "value": valor,
+            "date": data_ref,
+        }
+    return Response(payload)
+
+
 # -------------------
 # Dashboard RV
 # -------------------
@@ -491,47 +571,88 @@ def dashboard_rv(request):
         if ip:
             ticker_ips[base] = ip
 
-    cotacoes: dict[str, float] = {}
+    cotacoes: dict[str, dict[str, float]] = {}
     # 1) MT5 por ticker base
     for base, ip in ticker_ips.items():
-        preco = _mt5_preco_atual(ip, base)
-        if preco is not None:
-            cotacoes[f"{base}.SA"] = float(preco)
+        info = _mt5_cotacao_info(ip, base)
+        if info:
+            cotacoes[f"{base}.SA"] = info
 
-    # 2) fallback yfinance para os que faltaram
+    # 2) fallback yfinance para preencher ausências ou máximas/mínimas
     tickers_all = list({(op.acao.ticker or '').strip().upper() + ".SA" for op in posicoes if op.acao and op.acao.ticker})
-    faltando = [t for t in tickers_all if t not in cotacoes]
+    faltando = [
+        t
+        for t in tickers_all
+        if t not in cotacoes
+        or any(cotacoes[t].get(k) is None for k in ("preco", "max", "min"))
+    ]
     if faltando:
         try:
-            data = yf.download(tickers=faltando, period="1d", interval="1d", progress=False)["Close"].iloc[-1]
-            if hasattr(data, "to_dict"):
-                cotacoes.update({k: float(v) for k, v in data.to_dict().items()})
-            else:
-                # quando há apenas um ticker
-                cotacoes[faltando[0]] = float(data)
+            data = yf.download(
+                tickers=faltando,
+                period="1d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+            )
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                raise ValueError("Sem dados do yfinance")
+
+            # Seleciona a última linha disponível
+            last_row = data.iloc[-1]
+
+            def _get_value(row, column, ticker):
+                try:
+                    if isinstance(row.index, pd.MultiIndex):
+                        raw = row[(column, ticker)]
+                    else:
+                        raw = row[column]
+                except Exception:
+                    return None
+                return _finite_float(raw)
+
+            for ticker in faltando:
+                entry = cotacoes.setdefault(ticker, {})
+                close_val = _get_value(last_row, "Close", ticker)
+                high_val = _get_value(last_row, "High", ticker)
+                low_val = _get_value(last_row, "Low", ticker)
+
+                if entry.get("preco") is None and close_val is not None:
+                    entry["preco"] = close_val
+                if entry.get("max") is None and high_val is not None:
+                    entry["max"] = high_val
+                if entry.get("min") is None and low_val is not None:
+                    entry["min"] = low_val
         except Exception:
             pass
 
     posicionadas = []
     for op in posicoes:
         ticker = (op.acao.ticker or '').strip().upper() + ".SA"
-        preco_atual = cotacoes.get(ticker)
+        info = cotacoes.get(ticker, {})
+        preco_atual = _finite_float(info.get("preco"))
+        preco_max = _finite_float(info.get("max"))
+        preco_min = _finite_float(info.get("min"))
         dias_pos = (hoje - op.data_compra).days
 
         lucro = (
             ((preco_atual - float(op.preco_unitario)) / float(op.preco_unitario)) * 100
-            if preco_atual else None
+            if preco_atual is not None and op.preco_unitario not in (None, 0)
+            else None
         )
 
         posicionadas.append({
             "id": op.id,
             "cliente": op.cliente.nome,
+            "cliente_id": op.cliente_id,
             "acao": op.acao.ticker,
             "data_compra": str(op.data_compra),
             "preco_compra": float(op.preco_unitario),
             "quantidade": op.quantidade,
             "valor_total_compra": float(op.valor_total_compra),
-            "preco_atual": float(preco_atual) if preco_atual else None,
+            "preco_atual": float(preco_atual) if preco_atual is not None else None,
+            "preco_max": float(preco_max) if preco_max is not None else None,
+            "preco_min": float(preco_min) if preco_min is not None else None,
             "lucro_percentual": lucro,
             "valor_alvo": float(op.valor_alvo) if op.valor_alvo else None,
             "dias_posicionado": dias_pos,
@@ -1344,26 +1465,69 @@ def clientes_mt5_status(request):
 @permission_classes([IsAuthenticated])
 def recomendacoes_disponiveis(request, cliente_id: int):
     try:
-        Cliente.objects.get(pk=cliente_id)
+        cliente = Cliente.objects.get(pk=cliente_id)
     except Cliente.DoesNotExist:
         return Response({"detail": "Cliente não encontrado"}, status=404)
 
     # ações em aberto do cliente
     abertos = OperacaoCarteira.objects.filter(cliente_id=cliente_id, data_venda__isnull=True).values_list("acao_id", flat=True)
     qs = RecomendacaoDiariaAtualNova.objects.exclude(acao_id__in=list(abertos)).order_by("-probabilidade", "-percentual_estimado", "-data")
-    dados = [
-        {
-            "acao_id": r.acao_id,
-            "ticker": r.ticker,
-            "empresa": r.empresa,
-            "preco_compra": float(r.preco_compra or 0),
-            "alvo_sugerido": float(r.alvo_sugerido or 0),
-            "percentual_estimado": float(r.percentual_estimado or 0),
-            "probabilidade": float(r.probabilidade or 0),
-        }
-        for r in qs
-    ]
+
+    tickers_base = [(r.ticker or "").strip().upper() for r in qs if r.ticker]
+    tickers_base = list({t for t in tickers_base if t})
+    cotacoes, origens = _cotacoes_cliente(cliente, tickers_base)
+
+    dados = []
+    for r in qs:
+        base_ticker = (r.ticker or "").strip().upper()
+        cot_atual = cotacoes.get(base_ticker)
+        alvo_5 = float(cot_atual * 1.05) if cot_atual is not None else None
+        dados.append(
+            {
+                "acao_id": r.acao_id,
+                "ticker": r.ticker,
+                "empresa": r.empresa,
+                "preco_compra": float(r.preco_compra or 0),
+                "alvo_sugerido": float(r.alvo_sugerido or 0),
+                "percentual_estimado": float(r.percentual_estimado or 0),
+                "probabilidade": float(r.probabilidade or 0),
+                "cotacao_atual": float(cot_atual) if cot_atual is not None else None,
+                "cotacao_origem": origens.get(base_ticker),
+                "alvo_sugerido_5pct": alvo_5,
+            }
+        )
     return Response(dados)
+
+
+# =============================
+# Cotação individual (MT5 + fallback)
+# =============================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def mt5_cotacao_atual(request, cliente_id: int, ticker: str):
+    try:
+        cliente = Cliente.objects.get(pk=cliente_id)
+    except Cliente.DoesNotExist:
+        return Response({"detail": "Cliente não encontrado"}, status=404)
+
+    base = (ticker or "").strip().upper()
+    if not base:
+        return Response({"detail": "Ticker inválido"}, status=400)
+
+    cotacoes, origens = _cotacoes_cliente(cliente, [base])
+    cot = cotacoes.get(base)
+    origem = origens.get(base)
+    alvo = float(cot * 1.05) if cot is not None else None
+
+    return Response(
+        {
+            "ticker": base,
+            "cotacao": float(cot) if cot is not None else None,
+            "alvo_5pct": alvo,
+            "origem": origem,
+        }
+    )
 
 
 # =============================
@@ -1374,6 +1538,56 @@ def _get_cliente_ip(cliente: Cliente) -> str | None:
     ip_publico = (cliente.vm_ip or "").strip()
     ip_privado = (cliente.vm_private_ip or "").strip()
     return ip_privado or ip_publico or None
+
+
+def _cotacoes_cliente(cliente: Cliente, tickers_base: list[str]) -> tuple[dict[str, float], dict[str, str]]:
+    """Retorna cotação atual por ticker base usando MT5 com fallback em yfinance."""
+    cotacoes: dict[str, float] = {}
+    origens: dict[str, str] = {}
+
+    if not tickers_base:
+        return cotacoes, origens
+
+    ip = _get_cliente_ip(cliente)
+    if ip:
+        for base in tickers_base:
+            try:
+                preco = _mt5_preco_atual(ip, base)
+            except Exception:
+                preco = None
+            if preco is not None:
+                cotacoes[base] = float(preco)
+                origens[base] = "mt5"
+
+    faltando = [base for base in tickers_base if base not in cotacoes]
+    if not faltando:
+        return cotacoes, origens
+
+    tickers_sa = [f"{base}.SA" for base in faltando]
+    try:
+        data = yf.download(tickers=tickers_sa, period="1d", interval="1m", progress=False)
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            close = data["Close"]
+            if isinstance(close, pd.Series):
+                serie = close.dropna()
+                if not serie.empty:
+                    base = faltando[0]
+                    cotacoes[base] = float(serie.iloc[-1])
+                    origens[base] = "yfinance"
+            elif isinstance(close, pd.DataFrame):
+                for base in faltando:
+                    try:
+                        serie = close[f"{base}.SA"].dropna()
+                    except Exception:
+                        continue
+                    if serie.empty:
+                        continue
+                    cotacoes[base] = float(serie.iloc[-1])
+                    origens[base] = "yfinance"
+    except Exception:
+        pass
+
+    return cotacoes, origens
 
 
 def _base_from_symbol(symbol: str) -> str:
@@ -1793,6 +2007,37 @@ def mt5_compra_status(request, cliente_id: int, group_id):
             if symbol_key:
                 deals_by_symbol.setdefault(symbol_key, []).append(d)
 
+    # posições atuais (fallback quando o histórico ainda não refletiu os negócios)
+    posicoes_resp = mt5.posicoes()
+    posicoes_por_symbol: dict[str, dict[str, float | list]] = {}
+    if posicoes_resp.ok and isinstance(posicoes_resp.data, list):
+        for pos in posicoes_resp.data:
+            if not isinstance(pos, dict):
+                continue
+            symbol = (pos.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            volume_val = pos.get("volume")
+            if volume_val in (None, ""):
+                volume_val = pos.get("volume_float")
+            try:
+                volume = float(volume_val or 0)
+            except Exception:
+                volume = 0.0
+            price_val = pos.get("price_open") or pos.get("price")
+            try:
+                price = float(price_val) if price_val is not None else None
+            except Exception:
+                price = None
+
+            entry = posicoes_por_symbol.setdefault(
+                symbol,
+                {"volume": 0.0, "prices": []},
+            )
+            entry["volume"] = float(entry["volume"]) + volume
+            if price is not None:
+                entry["prices"].append(price)
+
     # atualiza status local e consolida volumes
     executed_all = True
     summary = []
@@ -1802,6 +2047,7 @@ def mt5_compra_status(request, cliente_id: int, group_id):
         order_deals = deals_by_order.get(order_id_key or 0, [])
         if not order_deals:
             order_deals = deals_by_symbol.get(o.symbol, [])
+
         vol_exec = 0.0
         vwap_num = 0.0
         for d in order_deals:
@@ -1835,11 +2081,25 @@ def mt5_compra_status(request, cliente_id: int, group_id):
                     }
                 )
 
-        if vol_exec >= float(o.volume_req):
+        pos_entry = posicoes_por_symbol.get(o.symbol)
+        pos_volume = float(pos_entry["volume"]) if pos_entry else 0.0
+        pos_avg = None
+        if pos_entry and pos_entry["prices"]:
+            pos_avg = sum(pos_entry["prices"]) / len(pos_entry["prices"])
+
+        required_volume = float(o.volume_req)
+        avg = (vwap_num / vol_exec) if vol_exec > 0 else None
+
+        if vol_exec < required_volume and pos_volume >= required_volume:
+            vol_exec = pos_volume
+            if pos_avg is not None:
+                vwap_num = pos_volume * pos_avg
+                avg = pos_avg
+
+        if required_volume > 0 and vol_exec >= required_volume:
             if o_status != "executada":
                 o.status = "executada"
                 o.save(update_fields=["status", "updated_at"])
-            avg = (vwap_num / vol_exec) if vol_exec > 0 else None
             summary.append(
                 {
                     "symbol": o.symbol,
@@ -2278,25 +2538,16 @@ def mt5_venda_status(request, cliente_id: int, group_id):
     })
 
 
-def _run_recomendacoes():
+def _run_recomendacoes(top_n: int | None = None):
+    stream = io.StringIO()
+    kwargs = {"stdout": stream, "stderr": stream}
+    if top_n is not None:
+        kwargs["top"] = top_n
     try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        script_path = os.path.join(base_dir, "core", "scripts", "A03Recomendcoes_intraday.py")
-
-        # executa o script com o mesmo Python do projeto
-        result = subprocess.run(
-            [sys.executable, script_path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode == 0:
-            return True, f"Rotina concluída com sucesso.\n{result.stdout}"
-        else:
-            return False, f"Erro na execução ({result.returncode}):\n{result.stderr}"
-    except Exception as e:
-        return False, f"Falha ao executar: {e}"  
+        call_command("gerar_recomendacoes_intraday", **kwargs)
+        return True, stream.getvalue()
+    except Exception as exc:
+        return False, f"Falha ao executar: {exc}"
 
 @api_view(["GET", "POST"]) 
 @permission_classes([IsAuthenticated])
@@ -2307,7 +2558,12 @@ def recomendacoes_api(request):
     """
     from .models import RecomendacaoDiariaAtualNova  # usa a view Nova
     if request.method == "POST":
-        ok, msg = _run_recomendacoes()
+        top_param = request.data.get("top") or request.query_params.get("top")
+        try:
+            top_value = int(top_param) if top_param is not None else None
+        except (TypeError, ValueError):
+            top_value = None
+        ok, msg = _run_recomendacoes(top_value)
         status = "success" if ok else "error"
         return JsonResponse({"status": status, "message": msg})
 

@@ -1,0 +1,1 @@
+/home/denis/b3finance/modelos/modelo_random_forest.pkl

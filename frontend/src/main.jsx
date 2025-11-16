@@ -24,6 +24,7 @@ const theme = createTheme({
         root: {
           padding: '4px 8px', // altura menor das células
           fontSize: '0.875rem', // fonte um pouco menor
+          transition: "background-color 0.2s ease",
         },
       },
     },
@@ -31,6 +32,14 @@ const theme = createTheme({
       styleOverrides: {
         root: {
           height: 32, // altura da linha
+          cursor: "pointer",
+          transition: "background-color 0.2s ease",
+          "&:hover > .MuiTableCell-root": {
+            backgroundColor: "rgba(196, 152, 32, 0.12)",
+          },
+          "&:hover > .MuiTableCell-root.MuiTableCell-head": {
+            backgroundColor: "inherit",
+          },
         },
       },
     },

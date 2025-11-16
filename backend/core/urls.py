@@ -7,11 +7,13 @@ from core.views import ( MyTokenObtainPairView, perfil_usuario, logout_view, Cli
                         ImportacaoUploadView, carteira_resumo, patrimonio_disponivel, recomendacoes_api,
                         clientes_mt5_status,
                         recomendacoes_disponiveis,
+                        mt5_cotacao_atual,
                         mt5_compra_validar,
                         mt5_compra,
                         mt5_compra_status,
                         mt5_venda,
                         mt5_venda_status,
+                        indices_economicos,
                         )
 
 
@@ -38,6 +40,7 @@ urlpatterns = [
     # API com o yfinance
     path("api/cotacoes-atuais/", cotacoes_atuais, name="cotacoes_atuais"),
     path("api/dashboard-rv/", dashboard_rv, name="dashboard_rv"),
+    path("api/indices/", indices_economicos, name="indices_economicos"),
     path('', include(router.urls)),
 
     # API para importar arquivos de Patrimônio e Custódia
@@ -57,6 +60,7 @@ urlpatterns = [
 
     # Recomendações disponíveis para um cliente (sem posição aberta)
     path("api/clientes/<int:cliente_id>/recomendacoes-disponiveis/", recomendacoes_disponiveis, name="recomendacoes_disponiveis"),
+    path("api/clientes/<int:cliente_id>/mt5/cotacao/<str:ticker>/", mt5_cotacao_atual, name="mt5_cotacao_atual"),
 
     # Fluxo de compra MT5
     path("api/clientes/<int:cliente_id>/mt5/compra/validar/", mt5_compra_validar, name="mt5_compra_validar"),

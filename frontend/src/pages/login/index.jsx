@@ -3,6 +3,8 @@ import { useState } from "react";
 import { Box, TextField, Button, Typography } from "@mui/material";
 import axios from "axios";
 
+const API_URL = import.meta.env.VITE_API_URL;
+
 export default function Login({ onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -11,7 +13,8 @@ export default function Login({ onLogin }) {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      const res = await axios.post("http://localhost:8000/api/token/", { username, password });
+      // const res = await axios.post("http://localhost:8000/api/token/", { username, password });
+      const res = await axios.post(`${API_URL}token/`, { username, password });
       localStorage.setItem("access_token", res.data.access);
       localStorage.setItem("username", res.data.username);
       onLogin(res.data); // avisa o App.jsx que login foi bem-sucedido

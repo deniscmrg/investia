@@ -1,5 +1,5 @@
 // src/components/Header.jsx
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   AppBar,
   Toolbar,
@@ -13,6 +13,7 @@ import {
 } from "@mui/material";
 import MenuIcon from "@mui/icons-material/Menu";
 import { Link } from "react-router-dom";
+import api from "../../services/api";
 
 export default function Header({ username = "Usuário", onLogout = () => {} }) {
   // Menu do usuário (desktop)
@@ -29,6 +30,44 @@ export default function Header({ username = "Usuário", onLogout = () => {} }) {
   const [anchorMobile, setAnchorMobile] = useState(null);
   const handleMobileOpen = (event) => setAnchorMobile(event.currentTarget);
   const handleMobileClose = () => setAnchorMobile(null);
+
+  const [indices, setIndices] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchIndices = async () => {
+      try {
+        const data = await api("indices/");
+        if (!cancelled) {
+          setIndices(data);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setIndices(null);
+        }
+        console.error("Falha ao carregar índices econômicos:", error);
+      }
+    };
+
+    fetchIndices();
+    const intervalId = setInterval(fetchIndices, 60 * 60 * 1000); // atualiza a cada 1h
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, []);
+
+  const formatIndexValue = (entry) => {
+    if (!entry || entry.value == null) {
+      return "--";
+    }
+    const value = Number(entry.value);
+    const formattedValue = Number.isFinite(value) ? `${value.toFixed(2)}%` : "--";
+    const dateLabel = entry.date ? ` (${entry.date})` : "";
+    return `${formattedValue}${dateLabel}`;
+  };
 
   const menuItems = [
     { label: "Painel de Controle", path: "/controle-rv" },
@@ -57,6 +96,19 @@ export default function Header({ username = "Usuário", onLogout = () => {} }) {
         >
           Invest-IA
         </Typography>
+
+        {/* Índices econômicos - desktop */}
+        <Box
+          sx={{
+            flex: 1,
+            display: { xs: "none", md: "flex" },
+            justifyContent: "center",
+          }}
+        >
+          <Typography variant="subtitle2" sx={{ fontWeight: 500 }}>
+            IPCA (12m): {formatIndexValue(indices?.ipca)} &nbsp;|&nbsp; IGP-M (12m): {formatIndexValue(indices?.igpm)} &nbsp;|&nbsp; SELIC: {formatIndexValue(indices?.selic)}
+          </Typography>
+        </Box>
 
         {/* Menu desktop */}
         <Box sx={{ display: { xs: "none", md: "flex" }, alignItems: "center" }}>
@@ -120,6 +172,13 @@ export default function Header({ username = "Usuário", onLogout = () => {} }) {
           </Menu>
         </Box>
 
+        {/* Índices - mobile */}
+        <Box sx={{ display: { xs: "block", md: "none" }, textAlign: "center", flexGrow: 1 }}>
+          <Typography variant="caption">
+            IPCA (12m): {formatIndexValue(indices?.ipca)} | IGP-M (12m): {formatIndexValue(indices?.igpm)} | SELIC: {formatIndexValue(indices?.selic)}
+          </Typography>
+        </Box>
+
         {/* Menu mobile */}
         <Box sx={{ display: { xs: "flex", md: "none" } }}>
           <IconButton color="inherit" onClick={handleMobileOpen} aria-label="menu">
@@ -167,5 +226,3 @@ export default function Header({ username = "Usuário", onLogout = () => {} }) {
     </AppBar>
   );
 }
-
-

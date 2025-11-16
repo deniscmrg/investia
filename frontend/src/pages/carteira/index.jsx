@@ -1,15 +1,42 @@
 import {
-  IconButton, Tooltip, Tabs, Tab,
-  Box, Typography, Table, TableHead, TableBody, TableRow, TableCell,
-  TextField, Dialog, DialogTitle, DialogContent, DialogActions, Button, MenuItem,
-  Backdrop, CircularProgress, Stack, RadioGroup, FormControlLabel, Radio, FormLabel, Chip, Snackbar, Alert
+  IconButton,
+  Tooltip,
+  Tabs,
+  Tab,
+  Box,
+  Typography,
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableCell,
+  TableSortLabel,
+  TextField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+  MenuItem,
+  Backdrop,
+  CircularProgress,
+  Stack,
+  RadioGroup,
+  FormControlLabel,
+  Radio,
+  FormLabel,
+  Chip,
+  Snackbar,
+  Alert,
 } from "@mui/material";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import AddIcon from "@mui/icons-material/Add";
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import api from "../../services/api";
+import OperacaoModal from "../../components/OperacaoModal";
 
 export default function Carteira() {
   const { id } = useParams();
@@ -21,18 +48,23 @@ export default function Carteira() {
   const [loading, setLoading] = useState(true);
   const [alerta, setAlerta] = useState({ open: false, severity: "info", text: "" });
 
-  const [open, setOpen] = useState(false);
-  const [editing, setEditing] = useState(null);
+  const [operationModalOpen, setOperationModalOpen] = useState(false);
+  const [operationEditing, setOperationEditing] = useState(null);
   const [tabIndex, setTabIndex] = useState(0);
 
   const [resumo, setResumo] = useState(null);
   const [updatingQuotes, setUpdatingQuotes] = useState(false);
+  const [order, setOrder] = useState("asc");
+  const [orderBy, setOrderBy] = useState("acao_nome");
 
   // ---------- MT5 Nova Compra (modais) ----------
   const [openRecModal, setOpenRecModal] = useState(false);
   const [openNovaCompraModal, setOpenNovaCompraModal] = useState(false);
   const [recsDisponiveis, setRecsDisponiveis] = useState([]);
   const [recSelecionada, setRecSelecionada] = useState(null);
+  const [cotacaoAtual, setCotacaoAtual] = useState(null);
+  const [alvoSugerido5, setAlvoSugerido5] = useState(null);
+  const [cotacaoAtualLoading, setCotacaoAtualLoading] = useState(false);
 
   const [execucao, setExecucao] = useState("mercado"); // mercado | limite
   const [modoEntrada, setModoEntrada] = useState("quantidade"); // quantidade | valor
@@ -65,15 +97,6 @@ export default function Carteira() {
   const [vendaStatus, setVendaStatus] = useState(null);
   const vendaIntervalRef = useRef(null);
 
-  // form
-  const [acao, setAcao] = useState("");
-  const [dataCompra, setDataCompra] = useState("");
-  const [precoUnitario, setPrecoUnitario] = useState("");
-  const [quantidade, setQuantidade] = useState("");
-  const [dataVenda, setDataVenda] = useState("");
-  const [precoVenda, setPrecoVenda] = useState("");
-  const [valorAlvo, setValorAlvo] = useState("");
-
   const opsRef = useRef([]);
   useEffect(() => { opsRef.current = operacoes; }, [operacoes]);
 
@@ -93,6 +116,114 @@ export default function Carteira() {
     const dc = new Date(op.data_compra);
     const diff = Math.floor((hoje.setHours(0,0,0,0) - dc.setHours(0,0,0,0)) / (1000 * 60 * 60 * 24));
     return diff >= 0 ? diff : null;
+  };
+  const calcTotalCompra = (op) => {
+    if (op?.valor_total_compra != null) return Number(op.valor_total_compra);
+    if (op?.preco_unitario != null && op?.quantidade != null) {
+      return Number(op.preco_unitario) * Number(op.quantidade);
+    }
+    return null;
+  };
+  const calcTotalVenda = (op) => {
+    if (op?.valor_total_venda != null) return Number(op.valor_total_venda);
+    if (op?.preco_venda_unitario != null && op?.quantidade != null) {
+      return Number(op.preco_venda_unitario) * Number(op.quantidade);
+    }
+    return null;
+  };
+  const calcVariacaoPercentual = (op) => {
+    if (op?.preco_atual != null && op?.preco_unitario != null && Number(op.preco_unitario) !== 0) {
+      return ((Number(op.preco_atual) - Number(op.preco_unitario)) / Number(op.preco_unitario)) * 100;
+    }
+    return null;
+  };
+  const calcToGainPercentual = (op) => {
+    if (op?.preco_atual != null && op?.valor_alvo != null && Number(op.preco_atual) !== 0) {
+      return ((Number(op.valor_alvo) - Number(op.preco_atual)) / Number(op.preco_atual)) * 100;
+    }
+    return null;
+  };
+  const calcPctResultado = (op) => {
+    const totalCompra = calcTotalCompra(op);
+    const totalVenda = calcTotalVenda(op);
+    if (totalCompra != null && totalVenda != null && totalCompra !== 0) {
+      return ((totalVenda - totalCompra) / totalCompra) * 100;
+    }
+    return null;
+  };
+  const calcValorResultado = (op) => {
+    const totalCompra = calcTotalCompra(op);
+    const totalVenda = calcTotalVenda(op);
+    if (totalCompra != null && totalVenda != null) {
+      return totalVenda - totalCompra;
+    }
+    return null;
+  };
+
+  const getSortValue = (op, property) => {
+    switch (property) {
+      case "acao_nome":
+        return op?.acao_nome ? String(op.acao_nome).toUpperCase() : "";
+      case "data_compra":
+        return op?.data_compra ? new Date(op.data_compra).getTime() : null;
+      case "preco_unitario":
+        return op?.preco_unitario != null ? Number(op.preco_unitario) : null;
+      case "quantidade":
+        return op?.quantidade != null ? Number(op.quantidade) : null;
+      case "valor_total_compra":
+        return calcTotalCompra(op);
+      case "valor_alvo":
+        return op?.valor_alvo != null ? Number(op.valor_alvo) : null;
+      case "dias":
+        return calcDiasPosicionado(op);
+      case "preco_atual":
+        return op?.preco_atual != null ? Number(op.preco_atual) : null;
+      case "variacao":
+        return calcVariacaoPercentual(op);
+      case "to_gain":
+        return calcToGainPercentual(op);
+      case "status":
+        return op?.status ? String(op.status).toUpperCase() : "";
+      case "data_venda":
+        return op?.data_venda ? new Date(op.data_venda).getTime() : null;
+      case "preco_venda_unitario":
+        return op?.preco_venda_unitario != null ? Number(op.preco_venda_unitario) : null;
+      case "valor_total_venda":
+        return calcTotalVenda(op);
+      case "pct_resultado":
+        return calcPctResultado(op);
+      case "valor_resultado":
+        return calcValorResultado(op);
+      default:
+        return op?.[property] ?? null;
+    }
+  };
+  const descendingComparator = (a, b, property) => {
+    const av = getSortValue(a, property);
+    const bv = getSortValue(b, property);
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (typeof av === "number" && typeof bv === "number") return bv - av;
+    return String(bv).localeCompare(String(av), undefined, { sensitivity: "base", numeric: true });
+  };
+  const getComparator = (sortOrder, property) =>
+    sortOrder === "desc"
+      ? (a, b) => descendingComparator(a, b, property)
+      : (a, b) => -descendingComparator(a, b, property);
+  const stableSort = (array, comparator) => {
+    const stabilized = (array || []).map((el, index) => [el, index]);
+    stabilized.sort((a, b) => {
+      const cmp = comparator(a[0], b[0]);
+      if (cmp !== 0) return cmp;
+      return a[1] - b[1];
+    });
+    return stabilized.map((el) => el[0]);
+  };
+  const handleRequestSort = (property) => {
+    const isAsc = orderBy === property && order === "asc";
+    setOrder(isAsc ? "desc" : "asc");
+    setOrderBy(property);
   };
 
   // ---------- data loaders ----------
@@ -140,15 +271,20 @@ export default function Carteira() {
     }
   };
 
+  const carregarOperacoes = async () => {
+    const opsRes = await api(`operacoes/?cliente=${id}`);
+    const lista = opsRes.results || opsRes || [];
+    setOperacoes(lista);
+    return lista;
+  };
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const clienteRes = await api(`clientes/${id}/`);
         setCliente(clienteRes);
 
-        const opsRes = await api(`operacoes/?cliente=${id}`);
-        const lista = opsRes.results || opsRes || [];
-        setOperacoes(lista);
+        await carregarOperacoes();
 
         // 1) resumo do backend (fonte da verdade)
         await fetchResumo();
@@ -168,70 +304,13 @@ export default function Carteira() {
     fetchData();
   }, [id]);
 
-  // ---------- ações ----------
-  const handleOpen = (op = null) => {
-    if (op) {
-      setEditing(op);
-      setAcao(op.acao);
-      setDataCompra(op.data_compra || "");
-      setPrecoUnitario(op.preco_unitario ?? "");
-      setQuantidade(op.quantidade ?? "");
-      setDataVenda(op.data_venda || "");
-      setPrecoVenda(op.preco_venda_unitario ?? "");
-      setValorAlvo(op.valor_alvo ?? "");
-    } else {
-      setEditing(null);
-      setAcao("");
-      setDataCompra("");
-      setPrecoUnitario("");
-      setQuantidade("");
-      setDataVenda("");
-      setPrecoVenda("");
-      setValorAlvo("");
-    }
-    setOpen(true);
+  const openOperacaoModal = (op = null) => {
+    setOperationEditing(op);
+    setOperationModalOpen(true);
   };
 
-  const handleClose = () => setOpen(false);
-
-  const handleSave = async () => {
-    const payload = {
-      cliente: Number(id),
-      acao: typeof acao === "object" ? acao.id : Number(acao),
-      data_compra: dataCompra || null,
-      preco_unitario: precoUnitario !== "" ? Number(precoUnitario) : null,
-      quantidade: quantidade !== "" ? Number(quantidade) : null,
-      data_venda: dataVenda || null,
-      preco_venda_unitario: precoVenda !== "" ? Number(precoVenda) : null,
-      valor_alvo: valorAlvo !== "" ? Number(valorAlvo) : null,
-    };
-
-    try {
-      if (editing) {
-        await api(`operacoes/${editing.id}/`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-      } else {
-        await api("operacoes/", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-      }
-
-      const opsRes = await api(`operacoes/?cliente=${id}`);
-      const lista = opsRes.results || opsRes || [];
-      setOperacoes(lista);
-      handleClose();
-
-      // Atualiza resumo (backend) e, se quiser, cotações
-      await fetchResumo();
-      // await fetchCotacoes(lista);
-    } catch (err) {
-      console.error("Erro ao salvar operação:", err);
-    }
+  const closeOperacaoModal = () => {
+    setOperationModalOpen(false);
   };
 
   const handleDelete = async (opId) => {
@@ -328,16 +407,52 @@ export default function Carteira() {
   const confirmarRecomendacao = (item) => {
     setRecSelecionada(item);
     setOpenRecModal(false);
+    const cot = item?.cotacao_atual != null ? Number(item.cotacao_atual) : (item?.preco_compra != null ? Number(item.preco_compra) : null);
+    const alvoSug = cot != null ? cot * 1.05 : (item?.alvo_sugerido != null ? Number(item.alvo_sugerido) : null);
+    setCotacaoAtual(cot);
+    setAlvoSugerido5(alvoSug);
+    setCotacaoAtualLoading(false);
     // reset form
     setExecucao("mercado");
     setModoEntrada("quantidade");
     setPrecoLimite("");
-    setTpAlvo("");
+    setTpAlvo(alvoSug != null ? alvoSug.toFixed(2) : "");
     setQtdDesejada("");
     setValorDesejado("");
     setLegsSugeridas([]);
     setValidacoesLegs([]);
     setOpenNovaCompraModal(true);
+  };
+
+  const atualizarCotacaoAtual = async () => {
+    if (!recSelecionada?.ticker) return;
+    setCotacaoAtualLoading(true);
+    try {
+      const resp = await api(`clientes/${id}/mt5/cotacao/${recSelecionada.ticker}/`);
+      const novoValor = resp?.cotacao != null ? Number(resp.cotacao) : null;
+      const novoAlvo = novoValor != null ? novoValor * 1.05 : null;
+
+      if (novoValor == null) {
+        mostrarAlerta("Não foi possível obter a cotação atual.", "warning");
+      }
+
+      const alvoAnteriorFormatado = alvoSugerido5 != null ? alvoSugerido5.toFixed(2) : "";
+
+      setCotacaoAtual(novoValor);
+      setAlvoSugerido5(novoAlvo);
+      setRecSelecionada((prev) => prev ? { ...prev, cotacao_atual: novoValor, alvo_sugerido_5pct: novoAlvo } : prev);
+
+      if (novoAlvo != null) {
+        if (tpAlvo === "" || tpAlvo === alvoAnteriorFormatado) {
+          setTpAlvo(novoAlvo.toFixed(2));
+        }
+      }
+    } catch (e) {
+      console.error("Erro ao atualizar cotação:", e);
+      mostrarAlerta("Erro ao atualizar cotação pelo MT5.", "error");
+    } finally {
+      setCotacaoAtualLoading(false);
+    }
   };
 
   const validarDistribuicao = async () => {
@@ -431,6 +546,7 @@ export default function Carteira() {
   } else if (tabIndex === 2) {
     operacoesFiltradas = operacoesDoCliente.filter(op => op.data_venda);  // REALIZADAS
   }
+  const sortedOperacoes = stableSort(operacoesFiltradas, getComparator(order, orderBy));
 
   return (
     <Box sx={{ mt: 12, px: 4 }}>
@@ -444,7 +560,7 @@ export default function Carteira() {
         <Button variant="contained" onClick={() => abrirNovaCompra()}>
           Nova Compra (MT5)
         </Button>
-        <Button variant="outlined" onClick={() => handleOpen()}>
+        <Button variant="outlined" startIcon={<AddIcon />} onClick={() => openOperacaoModal()}>
           Nova Operação (manual)
         </Button>
         <Button
@@ -510,61 +626,236 @@ export default function Carteira() {
         <Table>
           <TableHead>
             <TableRow>
-              <TableCell>Ação</TableCell>
-              <TableCell>Data Compra</TableCell>
-              <TableCell align="center">Preço Unitário</TableCell>
-              <TableCell align="center">Quantidade</TableCell>
-              <TableCell align="center">Valor Total Compra</TableCell>
+              <TableCell sortDirection={orderBy === "acao_nome" ? order : false}>
+                <TableSortLabel
+                  active={orderBy === "acao_nome"}
+                  direction={orderBy === "acao_nome" ? order : "asc"}
+                  onClick={() => handleRequestSort("acao_nome")}
+                >
+                  Ação
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sortDirection={orderBy === "data_compra" ? order : false}>
+                <TableSortLabel
+                  active={orderBy === "data_compra"}
+                  direction={orderBy === "data_compra" ? order : "asc"}
+                  onClick={() => handleRequestSort("data_compra")}
+                >
+                  Data Compra
+                </TableSortLabel>
+              </TableCell>
+              <TableCell
+                align="center"
+                sortDirection={orderBy === "preco_unitario" ? order : false}
+              >
+                <TableSortLabel
+                  active={orderBy === "preco_unitario"}
+                  direction={orderBy === "preco_unitario" ? order : "asc"}
+                  onClick={() => handleRequestSort("preco_unitario")}
+                >
+                  Preço Unitário
+                </TableSortLabel>
+              </TableCell>
+              <TableCell
+                align="center"
+                sortDirection={orderBy === "quantidade" ? order : false}
+              >
+                <TableSortLabel
+                  active={orderBy === "quantidade"}
+                  direction={orderBy === "quantidade" ? order : "asc"}
+                  onClick={() => handleRequestSort("quantidade")}
+                >
+                  Quantidade
+                </TableSortLabel>
+              </TableCell>
+              <TableCell
+                align="center"
+                sortDirection={orderBy === "valor_total_compra" ? order : false}
+              >
+                <TableSortLabel
+                  active={orderBy === "valor_total_compra"}
+                  direction={orderBy === "valor_total_compra" ? order : "asc"}
+                  onClick={() => handleRequestSort("valor_total_compra")}
+                >
+                  Valor Total Compra
+                </TableSortLabel>
+              </TableCell>
 
               {/* POSICIONADAS */}
-              {tabIndex === 1 && <TableCell align="center">Alvo (R$)</TableCell>}
-              {tabIndex === 1 && <TableCell align="center">Dias Posicionado</TableCell>}
-              {tabIndex === 1 && <TableCell align="center">Preço Atual</TableCell>}
-              {tabIndex === 1 && <TableCell align="center">Variação (%)</TableCell>}
-              {tabIndex === 1 && <TableCell align="center">To Gain (%)</TableCell>}
-              {tabIndex === 1 && <TableCell align="center">Status</TableCell>}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "valor_alvo" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "valor_alvo"}
+                    direction={orderBy === "valor_alvo" ? order : "asc"}
+                    onClick={() => handleRequestSort("valor_alvo")}
+                  >
+                    Alvo (R$)
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "dias" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "dias"}
+                    direction={orderBy === "dias" ? order : "asc"}
+                    onClick={() => handleRequestSort("dias")}
+                  >
+                    Dias Posicionado
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "preco_atual" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "preco_atual"}
+                    direction={orderBy === "preco_atual" ? order : "asc"}
+                    onClick={() => handleRequestSort("preco_atual")}
+                  >
+                    Preço Atual
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "variacao" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "variacao"}
+                    direction={orderBy === "variacao" ? order : "asc"}
+                    onClick={() => handleRequestSort("variacao")}
+                  >
+                    Variação (%)
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "to_gain" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "to_gain"}
+                    direction={orderBy === "to_gain" ? order : "asc"}
+                    onClick={() => handleRequestSort("to_gain")}
+                  >
+                    To Gain (%)
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 1 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "status" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "status"}
+                    direction={orderBy === "status" ? order : "asc"}
+                    onClick={() => handleRequestSort("status")}
+                  >
+                    Status
+                  </TableSortLabel>
+                </TableCell>
+              )}
 
               {/* REALIZADAS */}
-              {tabIndex === 2 && <TableCell>Data Venda</TableCell>}
-              {tabIndex === 2 && <TableCell align="center">Preço Venda</TableCell>}
-              {tabIndex === 2 && <TableCell align="center">Valor Total Venda</TableCell>}
-              {tabIndex === 2 && <TableCell align="center">% Resultado</TableCell>}
-              {tabIndex === 2 && <TableCell align="center">Valor Resultado</TableCell>}
+              {tabIndex === 2 && (
+                <TableCell sortDirection={orderBy === "data_venda" ? order : false}>
+                  <TableSortLabel
+                    active={orderBy === "data_venda"}
+                    direction={orderBy === "data_venda" ? order : "asc"}
+                    onClick={() => handleRequestSort("data_venda")}
+                  >
+                    Data Venda
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 2 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "preco_venda_unitario" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "preco_venda_unitario"}
+                    direction={orderBy === "preco_venda_unitario" ? order : "asc"}
+                    onClick={() => handleRequestSort("preco_venda_unitario")}
+                  >
+                    Preço Venda
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 2 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "valor_total_venda" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "valor_total_venda"}
+                    direction={orderBy === "valor_total_venda" ? order : "asc"}
+                    onClick={() => handleRequestSort("valor_total_venda")}
+                  >
+                    Valor Total Venda
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 2 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "pct_resultado" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "pct_resultado"}
+                    direction={orderBy === "pct_resultado" ? order : "asc"}
+                    onClick={() => handleRequestSort("pct_resultado")}
+                  >
+                    % Resultado
+                  </TableSortLabel>
+                </TableCell>
+              )}
+              {tabIndex === 2 && (
+                <TableCell
+                  align="center"
+                  sortDirection={orderBy === "valor_resultado" ? order : false}
+                >
+                  <TableSortLabel
+                    active={orderBy === "valor_resultado"}
+                    direction={orderBy === "valor_resultado" ? order : "asc"}
+                    onClick={() => handleRequestSort("valor_resultado")}
+                  >
+                    Valor Resultado
+                  </TableSortLabel>
+                </TableCell>
+              )}
 
               <TableCell>Ações</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {operacoesFiltradas.map((op) => {
-              const variacao = (op.preco_atual != null && op.preco_unitario)
-                ? (((Number(op.preco_atual) - Number(op.preco_unitario)) / Number(op.preco_unitario)) * 100).toFixed(2)
-                : "-";
+            {sortedOperacoes.map((op) => {
+              const variacao = calcVariacaoPercentual(op);
+              const variacaoLabel = variacao != null ? variacao.toFixed(2) : "-";
 
-              const toGain = (op.preco_atual != null && op.valor_alvo != null)
-                ? (((Number(op.valor_alvo) - Number(op.preco_atual)) / Number(op.preco_atual)) * 100).toFixed(2)
-                : "-";
+              const toGain = calcToGainPercentual(op);
+              const toGainLabel = toGain != null ? toGain.toFixed(2) : "-";
 
               const dias = calcDiasPosicionado(op);
 
-              const totalCompra = (op.valor_total_compra != null)
-                ? Number(op.valor_total_compra)
-                : (op.preco_unitario != null && op.quantidade != null)
-                  ? Number(op.preco_unitario) * Number(op.quantidade)
-                  : null;
+              const totalCompra = calcTotalCompra(op);
+              const totalVenda = calcTotalVenda(op);
 
-              const totalVenda = (op.valor_total_venda != null)
-                ? Number(op.valor_total_venda)
-                : (op.preco_venda_unitario != null && op.quantidade != null)
-                  ? Number(op.preco_venda_unitario) * Number(op.quantidade)
-                  : null;
+              const pctResultado = calcPctResultado(op);
+              const pctResultadoLabel = pctResultado != null ? pctResultado.toFixed(2) : "-";
 
-              const pctResultado = (op.preco_venda_unitario != null && op.preco_unitario)
-                ? (((Number(op.preco_venda_unitario) - Number(op.preco_unitario)) / Number(op.preco_unitario)) * 100).toFixed(2)
-                : "-";
-
-              const valorResultado = (totalVenda != null && totalCompra != null)
-                ? (totalVenda - totalCompra)
-                : null;
+              const valorResultado = calcValorResultado(op);
 
               return (
                 <TableRow key={op.id}>
@@ -572,19 +863,25 @@ export default function Carteira() {
                   <TableCell>{op.data_compra}</TableCell>
                   <TableCell align="center">{formatCurrency(op.preco_unitario)}</TableCell>
                   <TableCell align="center">{op.quantidade}</TableCell>
-                  <TableCell align="center">{formatCurrency(op.valor_total_compra)}</TableCell>
+                  <TableCell align="center">{formatCurrency(totalCompra)}</TableCell>
 
                   {tabIndex === 1 && <TableCell align="center">{formatCurrency(op.valor_alvo)}</TableCell>}
                   {tabIndex === 1 && <TableCell align="center">{dias ?? "-"}</TableCell>}
                   {tabIndex === 1 && <TableCell align="center">{op.preco_atual != null ? formatCurrency(op.preco_atual) : "-"}</TableCell>}
                   {tabIndex === 1 && (
-                    <TableCell align="center" sx={{ color: variacao !== "-" && Number(variacao) >= 0 ? "green" : "red" }}>
-                      {variacao}%
+                    <TableCell
+                      align="center"
+                      sx={{ color: variacao != null ? (variacao >= 0 ? "green" : "red") : "inherit" }}
+                    >
+                      {variacao != null ? `${variacaoLabel}%` : "-"}
                     </TableCell>
                   )}
                   {tabIndex === 1 && (
-                    <TableCell align="center" sx={{ color: toGain !== "-" && Number(toGain) <= 0 ? "green" : "orange" }}>
-                      {toGain}%
+                    <TableCell
+                      align="center"
+                      sx={{ color: toGain != null ? (toGain <= 0 ? "green" : "orange") : "inherit" }}
+                    >
+                      {toGain != null ? `${toGainLabel}%` : "-"}
                     </TableCell>
                   )}
 
@@ -607,8 +904,11 @@ export default function Carteira() {
                   {tabIndex === 2 && <TableCell align="center">{formatCurrency(totalVenda)}</TableCell>}
                   {tabIndex === 2 && <TableCell align="center">{formatCurrency(totalVenda)}</TableCell>}
                   {tabIndex === 2 && (
-                    <TableCell align="center" sx={{ color: pctResultado !== "-" && Number(pctResultado) >= 0 ? "green" : "red" }}>
-                      {pctResultado}%
+                    <TableCell
+                      align="center"
+                      sx={{ color: pctResultado != null ? (pctResultado >= 0 ? "green" : "red") : "inherit" }}
+                    >
+                      {pctResultado != null ? `${pctResultadoLabel}%` : "-"}
                     </TableCell>
                   )}
                   {tabIndex === 2 && (
@@ -619,7 +919,7 @@ export default function Carteira() {
 
                   <TableCell>
                     <Tooltip title="Editar">
-                      <IconButton size="small" onClick={() => handleOpen(op)}>
+                      <IconButton size="small" onClick={() => openOperacaoModal(op)}>
                         <EditIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
@@ -643,27 +943,18 @@ export default function Carteira() {
         </Table>
       )}
 
-      {/* Dialog criar/editar operação */}
-      <Dialog open={open} onClose={handleClose}>
-        <DialogTitle>{editing ? "Editar Operação" : "Nova Operação"}</DialogTitle>
-        <DialogContent>
-          <TextField select label="Ação" fullWidth value={acao} onChange={(e) => setAcao(e.target.value)} sx={{ mt: 1 }}>
-            {acoesDisponiveis.map((a) => (
-              <MenuItem key={a.id} value={a.id}>{a.ticker}</MenuItem>
-            ))}
-          </TextField>
-          <TextField label="Data Compra" type="date" fullWidth value={dataCompra} onChange={(e) => setDataCompra(e.target.value)} InputLabelProps={{ shrink: true }} sx={{ mt: 2 }} />
-          <TextField label="Preço Unitário" type="number" fullWidth value={precoUnitario} onChange={(e) => setPrecoUnitario(e.target.value)} sx={{ mt: 2 }} />
-          <TextField label="Quantidade" type="number" fullWidth value={quantidade} onChange={(e) => setQuantidade(e.target.value)} sx={{ mt: 2 }} />
-          <TextField label="Alvo (R$)" type="number" fullWidth value={valorAlvo} onChange={(e) => setValorAlvo(e.target.value)} sx={{ mt: 2 }} />
-          <TextField label="Data Venda" type="date" fullWidth value={dataVenda} onChange={(e) => setDataVenda(e.target.value)} InputLabelProps={{ shrink: true }} sx={{ mt: 2 }} />
-          <TextField label="Preço Venda" type="number" fullWidth value={precoVenda} onChange={(e) => setPrecoVenda(e.target.value)} sx={{ mt: 2 }} />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={handleClose}>Cancelar</Button>
-          <Button variant="contained" onClick={handleSave}>{editing ? "Salvar" : "Criar"}</Button>
-        </DialogActions>
-      </Dialog>
+      <OperacaoModal
+        open={operationModalOpen}
+        onClose={closeOperacaoModal}
+        operacao={operationEditing}
+        clienteId={Number(id)}
+        clienteNome={cliente?.nome}
+        acoes={acoesDisponiveis}
+        onAfterSave={async () => {
+          await carregarOperacoes();
+          await fetchResumo();
+        }}
+      />
 
       {/* Modal: Selecionar recomendação */}
       <Dialog open={openRecModal} onClose={() => setOpenRecModal(false)} maxWidth="md" fullWidth>
@@ -674,25 +965,29 @@ export default function Carteira() {
               <TableRow>
                 <TableCell>Ticker</TableCell>
                 <TableCell>Empresa</TableCell>
-                <TableCell align="right">Preço Ref</TableCell>
-                <TableCell align="right">Alvo Sug.</TableCell>
+                <TableCell align="right">Cotação atual</TableCell>
+                <TableCell align="right">Alvo sugerido (5%)</TableCell>
                 <TableCell align="right">Prob.</TableCell>
                 <TableCell></TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
-              {recsDisponiveis.map((r) => (
-                <TableRow key={r.acao_id}>
-                  <TableCell>{r.ticker}</TableCell>
-                  <TableCell>{r.empresa}</TableCell>
-                  <TableCell align="right">{formatCurrency(r.preco_compra)}</TableCell>
-                  <TableCell align="right">{formatCurrency(r.alvo_sugerido)}</TableCell>
-                  <TableCell align="right">{r.probabilidade}%</TableCell>
-                  <TableCell>
-                    <Button variant="contained" size="small" onClick={() => confirmarRecomendacao(r)}>Selecionar</Button>
-                  </TableCell>
-                </TableRow>
-              ))}
+              {recsDisponiveis.map((r) => {
+                const cotRef = r.cotacao_atual != null ? Number(r.cotacao_atual) : (r.preco_compra != null ? Number(r.preco_compra) : null);
+                const alvo5 = r.alvo_sugerido_5pct != null ? Number(r.alvo_sugerido_5pct) : (cotRef != null ? cotRef * 1.05 : null);
+                return (
+                  <TableRow key={r.acao_id}>
+                    <TableCell>{r.ticker}</TableCell>
+                    <TableCell>{r.empresa}</TableCell>
+                    <TableCell align="right">{formatCurrency(cotRef)}</TableCell>
+                    <TableCell align="right">{formatCurrency(alvo5)}</TableCell>
+                    <TableCell align="right">{r.probabilidade}%</TableCell>
+                    <TableCell>
+                      <Button variant="contained" size="small" onClick={() => confirmarRecomendacao(r)}>Selecionar</Button>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </DialogContent>
@@ -705,7 +1000,22 @@ export default function Carteira() {
       <Dialog open={openNovaCompraModal} onClose={() => setOpenNovaCompraModal(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Nova Compra (MT5) — {recSelecionada?.ticker}</DialogTitle>
         <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
+          <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mt: 1 }}>
+            <Typography variant="body2"><strong>Cotação atual:</strong> {cotacaoAtual != null ? `R$ ${formatCurrency(cotacaoAtual)}` : "-"}</Typography>
+            <Typography variant="body2"><strong>Alvo sugerido (5%):</strong> {alvoSugerido5 != null ? `R$ ${formatCurrency(alvoSugerido5)}` : "-"}</Typography>
+            <Tooltip title={cotacaoAtualLoading ? "Atualizando..." : "Atualizar cotação"}>
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={atualizarCotacaoAtual}
+                  disabled={cotacaoAtualLoading || !recSelecionada?.ticker}
+                >
+                  {cotacaoAtualLoading ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+          <Stack spacing={2} sx={{ mt: 2 }}>
             <TextField select label="Execução" value={execucao} onChange={(e) => setExecucao(e.target.value)}>
               <MenuItem value="mercado">Mercado</MenuItem>
               <MenuItem value="limite">Limite</MenuItem>

@@ -4,7 +4,6 @@ import django
 import pandas as pd
 import numpy as np
 import joblib
-import yfinance as yf
 from django.db.models import Max
 from django.db import models
 from decimal import Decimal
@@ -20,6 +19,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 django.setup()
 
 from core.models import Cotacao, RecomendacaoDiaria, Acao
+from core.services.intraday_quotes import fetch_intraday_quotes
 
 def gerar_recomendacoes(top_n=30):
     ultima_data = Cotacao.objects.aggregate(ultima=Max('data'))['ultima']
@@ -86,19 +86,7 @@ def gerar_recomendacoes(top_n=30):
 
     # Preço intraday
     print("\n🔄 Buscando cotações intraday...")
-    precos_atuais = {}
-    for ticker in df['acao__ticker'].unique():
-        try:
-            yf_ticker = yf.Ticker(ticker + '.SA')
-            preco_atual = yf_ticker.history(period="1d", interval="1m")['Close'].dropna()
-            if not preco_atual.empty:
-                precos_atuais[ticker] = preco_atual.iloc[-1]
-            else:
-                precos_atuais[ticker] = np.nan
-        except Exception as e:
-            print(f"Erro ao buscar {ticker}: {e}")
-            precos_atuais[ticker] = np.nan
-
+    precos_atuais = fetch_intraday_quotes(df['acao__ticker'].unique())
     df['preco_atual'] = df['acao__ticker'].map(precos_atuais)
     df.dropna(subset=['preco_atual'], inplace=True)
     df['preco_compra'] = df['preco_atual'].astype(float)
