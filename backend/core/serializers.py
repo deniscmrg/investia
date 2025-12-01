@@ -1,8 +1,21 @@
 from datetime import date
+from decimal import Decimal, InvalidOperation
+
 from django.contrib.auth.models import User
 from rest_framework import serializers
-from .models import Cliente, Acao, OperacaoCarteira, Patrimonio, Custodia, RecomendacaoDiariaAtualNova, MT5Order, OperacaoMT5Leg
-from decimal import Decimal, InvalidOperation
+
+from .models import (
+    Acao,
+    Cliente,
+    Custodia,
+    EstatisticaEstrategia,
+    MT5Order,
+    OperacaoCarteira,
+    OperacaoMT5Leg,
+    Patrimonio,
+    RecomendacaoDiariaAtualNova,
+    RecomendacaoIA,
+)
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -214,3 +227,128 @@ class RecomendacaoDiariaAtualNovaSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecomendacaoDiariaAtualNova
         fields = "__all__"
+
+
+class RecomendacaoIASerializer(serializers.ModelSerializer):
+    acao_ticker = serializers.CharField(source="acao.ticker", read_only=True)
+    acao_empresa = serializers.CharField(source="acao.empresa", read_only=True)
+    acao_setor = serializers.CharField(source="acao.setor", read_only=True)
+
+    qtd_testes = serializers.SerializerMethodField()
+    qtd_acertos = serializers.SerializerMethodField()
+    maior_ganho_10d = serializers.SerializerMethodField()
+    maior_perda_10d = serializers.SerializerMethodField()
+    hit_rate = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RecomendacaoIA
+        fields = [
+            "id",
+            "acao",
+            "acao_ticker",
+            "acao_empresa",
+            "acao_setor",
+            "data",
+            "preco_entrada",
+            "alvo_percentual",
+            "janela_dias",
+            "prob_up",
+            "prob_down",
+            "classe",
+            "dias_equivalentes_selic",
+            "data_limite_selic",
+            "retorno_medio_selic_ativo",
+            "origem",
+            "qtd_testes",
+            "qtd_acertos",
+            "maior_ganho_10d",
+            "maior_perda_10d",
+            "hit_rate",
+        ]
+
+    def _get_estatistica(self, obj):
+        """
+        Retorna EstatisticaEstrategia mais relevante para uma recomendação:
+        - lado derivado da classe/probabilidades
+        - faixa de probabilidade que inclui prob_up/prob_down
+        - tenta primeiro específico da ação, depois estatística global.
+        """
+        # Determina lado e probabilidade de referência
+        prob_up = float(obj.prob_up or 0.0)
+        prob_down = float(obj.prob_down or 0.0)
+
+        if obj.classe == "UP_FIRST":
+            lado = "COMPRA"
+            prob_ref = prob_up
+        elif obj.classe == "DOWN_FIRST":
+            lado = "VENDA"
+            prob_ref = prob_down
+        else:
+            # NONE → usa lado com maior probabilidade
+            if prob_up >= prob_down:
+                lado = "COMPRA"
+                prob_ref = prob_up
+            else:
+                lado = "VENDA"
+                prob_ref = prob_down
+
+        qs_base = EstatisticaEstrategia.objects.filter(
+            origem=obj.origem or "modelo_direcional_v1",
+            lado=lado,
+        )
+
+        estat = qs_base.filter(
+            acao=obj.acao,
+            faixa_prob_min__lte=prob_ref,
+            faixa_prob_max__gt=prob_ref,
+        ).first()
+
+        if estat is None:
+            estat = qs_base.filter(
+                acao__isnull=True,
+                faixa_prob_min__lte=prob_ref,
+                faixa_prob_max__gt=prob_ref,
+            ).first()
+
+        return estat
+
+    def get_qtd_testes(self, obj):
+        estat = self._get_estatistica(obj)
+        return estat.numero_trades if estat else None
+
+    def get_qtd_acertos(self, obj):
+        estat = self._get_estatistica(obj)
+        if not estat:
+            return None
+        try:
+            hit_rate = float(estat.hit_rate or 0.0) / 100.0
+            return int(round(estat.numero_trades * hit_rate))
+        except (TypeError, ValueError):
+            return None
+
+    def get_maior_ganho_10d(self, obj):
+        estat = self._get_estatistica(obj)
+        if not estat:
+            return None
+        try:
+            return float(estat.ganho_maximo)
+        except (TypeError, ValueError):
+            return None
+
+    def get_maior_perda_10d(self, obj):
+        estat = self._get_estatistica(obj)
+        if not estat:
+            return None
+        try:
+            return float(estat.perda_maxima)
+        except (TypeError, ValueError):
+            return None
+
+    def get_hit_rate(self, obj):
+        estat = self._get_estatistica(obj)
+        if not estat:
+            return None
+        try:
+            return float(estat.hit_rate)
+        except (TypeError, ValueError):
+            return None

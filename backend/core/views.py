@@ -6,7 +6,7 @@ import re
 from decimal import Decimal, InvalidOperation
 import math
 
-from django.db.models import Sum, F, ExpressionWrapper, DecimalField
+from django.db.models import Sum, F, ExpressionWrapper, DecimalField, Q
 from django.http import JsonResponse
 
 import yfinance as yf
@@ -37,18 +37,23 @@ from .models import (
     Cliente,
     OperacaoCarteira,
     Acao,
-    ImportacaoJob,   # log das importações (mantido)
-    Patrimonio,      # <<< tipado
+    ImportacaoJob,  # log das importações (mantido)
+    Patrimonio,  # <<< tipado
     Custodia,
     Cotacao,
-    RecomendacaoDiariaAtual, RecomendacaoDiariaAtualNova,
-    MT5Order, MT5Deal, OperacaoMT5Leg,
+    RecomendacaoDiariaAtual,
+    RecomendacaoDiariaAtualNova,
+    RecomendacaoIA,
+    MT5Order,
+    MT5Deal,
+    OperacaoMT5Leg,
 )
 from .serializers import (
     UserSerializer,
     ClienteSerializer,
     OperacaoCarteiraSerializer,
     AcaoSerializer,
+    RecomendacaoIASerializer,
 )
 from .mt5_client import MT5Client, MT5Response
 from uuid import uuid4
@@ -448,6 +453,102 @@ class AcaoViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
+class RecomendacaoIAViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Lista recomendações da IA direcional.
+
+    Filtros via query params:
+        - data (YYYY-MM-DD), default = hoje
+        - tipo = compra | venda | todos
+        - min_prob = probabilidade mínima (float)
+    """
+
+    serializer_class = RecomendacaoIASerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = RecomendacaoIA.objects.select_related("acao")
+
+        # Filtro por data
+        data_param = self.request.query_params.get("data")
+        if data_param:
+            try:
+                ref_date = datetime.strptime(data_param, "%Y-%m-%d").date()
+            except ValueError:
+                ref_date = None
+        else:
+            ref_date = None
+
+        # Se nenhuma data válida foi informada, usa a última data disponível
+        if ref_date is None:
+            last_date = (
+                RecomendacaoIA.objects.order_by("-data")
+                .values_list("data", flat=True)
+                .first()
+            )
+            ref_date = last_date or date.today()
+
+        qs = qs.filter(data=ref_date)
+
+        tipo = (self.request.query_params.get("tipo") or "todos").lower()
+        min_prob_param = self.request.query_params.get("min_prob")
+        min_prob = None
+        if min_prob_param is not None:
+            try:
+                min_prob = float(min_prob_param)
+            except (TypeError, ValueError):
+                min_prob = None
+
+        if tipo == "compra":
+            qs = qs.filter(classe="UP_FIRST")
+            if min_prob is not None:
+                qs = qs.filter(prob_up__gte=min_prob)
+            qs = qs.order_by("-prob_up")
+        elif tipo == "venda":
+            qs = qs.filter(classe="DOWN_FIRST")
+            if min_prob is not None:
+                qs = qs.filter(prob_down__gte=min_prob)
+            qs = qs.order_by("-prob_down")
+        else:
+            # todos
+            if min_prob is not None:
+                qs = qs.filter(
+                    Q(classe="UP_FIRST", prob_up__gte=min_prob)
+                    | Q(classe="DOWN_FIRST", prob_down__gte=min_prob)
+                    | Q(classe="NONE")
+                )
+            qs = qs.order_by("-data", "acao__ticker")
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        """
+        Lista recomendações IA já com coluna de variação diária (%)
+        baseada no ticker da ação.
+        """
+        response = super().list(request, *args, **kwargs)
+
+        data = response.data
+        if not isinstance(data, list):
+            return response
+
+        # coleta tickers base (ex.: PETR4) presentes na resposta
+        tickers_base = []
+        for item in data:
+            ticker = (item.get("acao_ticker") or "").strip().upper()
+            if ticker:
+                tickers_base.append(ticker)
+
+        variacoes = _variacao_dia_por_ticker(tickers_base)
+
+        for item in data:
+            ticker = (item.get("acao_ticker") or "").strip().upper()
+            var = variacoes.get(ticker)
+            item["variacao_dia"] = float(var) if var is not None else None
+
+        return response
+
+
 # -------------------
 # Cotações helpers (MT5 first, yfinance fallback)
 # -------------------
@@ -494,6 +595,67 @@ def _mt5_preco_atual(ip: str | None, base_ticker: str) -> float | None:
     return _mt5_cotacao_info(ip, base_ticker).get("preco")
 
 
+def _variacao_dia_por_ticker(bases: list[str]) -> dict[str, float]:
+    """
+    Calcula % de variação do dia (preço atual vs abertura) por ticker base.
+
+    Estratégia:
+      - tenta obter o preço atual via MT5 usando um IP padrão (quando configurado);
+      - sempre busca dados do dia via yfinance para obter a abertura e,
+        quando necessário, também o preço atual;
+      - retorna apenas entradas válidas (com abertura > 0).
+    """
+    # normaliza tickers base (ex.: "PETR4")
+    bases_norm = sorted({(b or "").strip().upper() for b in bases if b})
+    if not bases_norm:
+        return {}
+
+    variacoes: dict[str, float] = {}
+    preços_atuais: dict[str, float] = {}
+
+    # 1) MT5 (opcional, IP padrão para cotações globais)
+    mt5_ip = getattr(settings, "MT5_QUOTES_IP", None) or getattr(
+        settings, "MT5_DEFAULT_IP", None
+    )
+    if mt5_ip:
+        for base in bases_norm:
+            try:
+                info = _mt5_cotacao_info(mt5_ip, base)
+                preco = _finite_float(info.get("preco"))
+                if preco is not None:
+                    preços_atuais[base] = preco
+            except Exception:
+                # silencioso: fallback total em yfinance
+                continue
+
+    # 2) yfinance para abertura (e preço atual quando MT5 não trouxe)
+    for base in bases_norm:
+        ticker_yf = f"{base}.SA"
+        preco_atual = preços_atuais.get(base)
+        preco_abertura = None
+
+        try:
+            acao = yf.Ticker(ticker_yf)
+            info = acao.info or {}
+            if preco_atual is None:
+                preco_atual = _finite_float(info.get("regularMarketPrice"))
+            preco_abertura = _finite_float(info.get("regularMarketOpen"))
+        except Exception:
+            preco_abertura = None
+
+        if preco_atual is None or not preco_abertura or preco_abertura == 0:
+            continue
+
+        try:
+            variacao = ((preco_atual - preco_abertura) / preco_abertura) * 100.0
+        except ZeroDivisionError:
+            continue
+
+        variacoes[base] = variacao
+
+    return variacoes
+
+
 # -------------------
 # Cotações (yfinance)
 # -------------------
@@ -514,9 +676,22 @@ def cotacoes_atuais(request):
         try:
             acao = yf.Ticker(ticker)
             info = acao.info
+            preco_atual = info.get("regularMarketPrice")
+            preco_abertura = info.get("regularMarketOpen")
+            variacao_pct = None
+            try:
+                if preco_atual is not None and preco_abertura not in (None, 0):
+                    variacao_pct = (
+                        (float(preco_atual) - float(preco_abertura))
+                        / float(preco_abertura)
+                    ) * 100.0
+            except Exception:
+                variacao_pct = None
+
             resultado[ticker] = {
-                "preco_atual": info.get("regularMarketPrice"),
-                "preco_abertura": info.get("regularMarketOpen"),
+                "preco_atual": preco_atual,
+                "preco_abertura": preco_abertura,
+                "variacao_pct": variacao_pct,
                 "moeda": info.get("currency"),
             }
         except Exception as e:
@@ -554,7 +729,52 @@ def dashboard_rv(request):
     hoje = date.today()
 
     # Todas as operações em aberto
-    posicoes = OperacaoCarteira.objects.filter(data_venda__isnull=True)
+    posicoes = list(
+        OperacaoCarteira.objects.filter(data_venda__isnull=True).select_related("acao", "cliente")
+    )
+
+    # Prepara mapas auxiliares para status sem N+1
+    op_ids = [op.id for op in posicoes if op.id]
+    legs_por_op = set(
+        OperacaoMT5Leg.objects.filter(operacao_id__in=op_ids).values_list("operacao_id", flat=True)
+    ) if op_ids else set()
+
+    req_ids = [f"op:{op_id}" for op_id in op_ids]
+    orders = (
+        MT5Order.objects.filter(request_id__in=req_ids).only("status", "request_id")
+        if req_ids else []
+    )
+    statuses_por_op: dict[int, list[str]] = {}
+    for ord in orders:
+        req = (ord.request_id or "").strip()
+        if not req.startswith("op:"):
+            continue
+        try:
+            op_id = int(req.split(":", 1)[1])
+        except Exception:
+            continue
+        statuses_por_op.setdefault(op_id, []).append(str(getattr(ord, "status", "")).lower())
+
+    def _status(op):
+        try:
+            if getattr(op, "data_venda", None):
+                return "encerrada"
+            if op.id in legs_por_op:
+                return "executada"
+            statuses = {s for s in statuses_por_op.get(op.id, []) if s}
+            if not statuses:
+                return "manual"
+            if statuses.issubset({"executada"}):
+                return "executada"
+            if "executada" in statuses or "parcial" in statuses:
+                return "parcial"
+            if "pendente" in statuses or "enviada" in statuses:
+                return "pendente"
+            if statuses.issubset({"rejeitada", "cancelada"}):
+                return "falha"
+        except Exception:
+            pass
+        return None
 
     # Tickers base e um IP MT5 associado (se existir) por ticker
     ticker_ips = {}
@@ -656,6 +876,7 @@ def dashboard_rv(request):
             "lucro_percentual": lucro,
             "valor_alvo": float(op.valor_alvo) if op.valor_alvo else None,
             "dias_posicionado": dias_pos,
+            "status": _status(op),
         })
 
     return Response({"posicionadas": posicionadas})
@@ -681,6 +902,21 @@ def _to_number(val):
         return float(Decimal(s))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _to_int(val):
+    """
+    Conversão resiliente para inteiro: usa a conversão numérica padrão e,
+    em caso de falha, tenta extrair apenas dígitos.
+    """
+    num = _to_number(val)
+    if num is not None:
+        try:
+            return int(num)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    digits = re.sub(r'\D', '', str(val or ''))
+    return int(digits) if digits else None
 
 def _xlsx_to_rows(file_bytes: bytes):
     """Converte Excel em lista de dicts (cabeçalho = primeira linha não vazia) usando a primeira aba.
@@ -768,8 +1004,19 @@ def _norm_key(k: str) -> str:
 HEADER_MAP_PATRIMONIO = {
     'cod. cliente': 'cod_cliente',
     'cód. cliente': 'cod_cliente',
+    'cod_cliente': 'cod_cliente',
+    'cod cliente': 'cod_cliente',
+    'cód cliente': 'cod_cliente',
+    'codigo cliente': 'cod_cliente',
+    'código cliente': 'cod_cliente',
+    'codigo do cliente': 'cod_cliente',
+    'código do cliente': 'cod_cliente',
+    'codcliente': 'cod_cliente',
     'codigo assessor': 'codigo_assessor',
     'código assessor': 'codigo_assessor',
+    'codigo_assessor': 'codigo_assessor',
+    'codigo_acessor': 'codigo_assessor',
+    'apelido': 'nome',
     'nome': 'nome',
     'patrimônio total': 'patrimonio_total',
     'patrimonio total': 'patrimonio_total',
@@ -785,9 +1032,20 @@ HEADER_MAP_PATRIMONIO = {
 HEADER_MAP_CUSTODIA = {
     'cod. cliente': 'cod_cliente',
     'cód. cliente': 'cod_cliente',
+    'cod_cliente': 'cod_cliente',
+    'cod cliente': 'cod_cliente',
+    'cód cliente': 'cod_cliente',
+    'codigo cliente': 'cod_cliente',
+    'código cliente': 'cod_cliente',
+    'codigo do cliente': 'cod_cliente',
+    'código do cliente': 'cod_cliente',
+    'codcliente': 'cod_cliente',
     'codigo assessor': 'codigo_assessor',
     'código assessor': 'codigo_assessor',
+    'codigo_assessor': 'codigo_assessor',
+    'codigo_acessor': 'codigo_assessor',
     'nome': 'nome',
+    'apelido': 'nome',
     'ativo': 'ativo',
     'ticker': 'ativo',
     'isin': 'isin',
@@ -808,11 +1066,16 @@ def _map_row(row: dict, tipo: str) -> dict:
         field = mapa[nk]
         if field in ('nome', 'ativo', 'isin', 'tipo_ativo'):
             out[field] = (None if v == '' else str(v).strip())
+        elif field in ('cod_cliente', 'codigo_assessor'):
+            out[field] = _to_int(v)
         else:
             out[field] = _to_number(v)
     # elimina linhas totalmente vazias
     if not any(v is not None and v != '' for v in out.values()):
         return {}
+    if tipo == 'patrimonio':
+        # força o código do assessor quando não vier no arquivo
+        out['codigo_assessor'] = out.get('codigo_assessor') or 22397
     return out
 
 
@@ -2575,8 +2838,18 @@ def recomendacoes_api(request):
         except Exception:
             return None
 
+    # calcula variação diária por ticker (atual vs abertura)
+    tickers_base = [
+        (r.ticker or "").strip().upper()
+        for r in qs
+        if getattr(r, "ticker", None)
+    ]
+    variacoes_map = _variacao_dia_por_ticker(tickers_base)
+
     dados = []
     for r in qs:
+        base_ticker = (r.ticker or "").strip().upper()
+        variacao_dia = variacoes_map.get(base_ticker)
         dados.append({
             "acao_id": r.acao_id,
             "ticker": r.ticker,
@@ -2603,6 +2876,7 @@ def recomendacoes_api(request):
             "AMP_MXxMN": _f(getattr(r, "AMP_MXxMN", None)),
             "A_x_F": _f(getattr(r, "A_x_F", None)),
             "ALVO": _f(getattr(r, "ALVO", None)),
+            "variacao_dia": _f(variacao_dia) if variacao_dia is not None else None,
         })
 
     return JsonResponse(dados, safe=False)

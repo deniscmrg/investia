@@ -45,8 +45,20 @@ async function apiFetch(endpoint, options = {}) {
 
 }
 
-// exporta como default
+// Função helper principal
 export default apiFetch;
 
-// e também nomeado, se precisar
+// Export nomeado para usos específicos
 export { apiFetch };
+
+// Helper para recomendações IA direcionais
+export async function getRecomendacoesIA({ tipo = "todos", data, minProb } = {}) {
+  const params = new URLSearchParams();
+  if (tipo) params.set("tipo", tipo);
+  if (data) params.set("data", data);
+  if (minProb != null) params.set("min_prob", String(minProb));
+  const qs = params.toString();
+  // API_URL já inclui o prefixo /api/, então aqui usamos apenas o path relativo
+  const endpoint = `recomendacoes-ia/${qs ? `?${qs}` : ""}`;
+  return apiFetch(endpoint);
+}

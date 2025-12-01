@@ -14,7 +14,7 @@ sys.path.append(BASE_DIR)
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 django.setup()
 
-from cotacoes.models import Cotacao, RecomendacaoDiaria
+from core.models import Cotacao, RecomendacaoDiaria
 
 def verificar_alvos_recomendacoes():
     recomendacoes = RecomendacaoDiaria.objects.filter(preco_compra__isnull=False)

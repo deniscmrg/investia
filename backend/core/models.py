@@ -176,6 +176,108 @@ class RecomendacaoDiariaAtual(models.Model):
         return f'{self.ticker} {self.data}'
 
 
+class RecomendacaoIA(models.Model):
+    acao = models.ForeignKey(Acao, on_delete=models.CASCADE, related_name="recomendacoes_ia")
+    data = models.DateField()
+    preco_entrada = models.DecimalField(max_digits=12, decimal_places=2)
+    alvo_percentual = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("5.00"))
+    janela_dias = models.IntegerField(default=10)
+
+    prob_up = models.DecimalField(max_digits=6, decimal_places=4)
+    prob_down = models.DecimalField(max_digits=6, decimal_places=4)
+    classe = models.CharField(
+        max_length=10,
+        choices=[
+            ("UP_FIRST", "Alvo de alta atingido primeiro"),
+            ("DOWN_FIRST", "Alvo de baixa atingido primeiro"),
+            ("NONE", "Nenhum dos alvos foi atingido na janela de 10 pregões"),
+        ],
+    )
+
+    dias_equivalentes_selic = models.IntegerField(null=True, blank=True)
+    data_limite_selic = models.DateField(null=True, blank=True)
+
+    retorno_medio_selic_ativo = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+
+    origem = models.CharField(max_length=50, default="modelo_direcional_v1")
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "cotacoes_recomendacao_ia"
+        managed = False
+        indexes = [
+            models.Index(fields=["data"]),
+            models.Index(fields=["classe"]),
+        ]
+        unique_together = ("acao", "data", "origem")
+
+    def __str__(self):
+        return f"{self.acao.ticker} {self.data} ({self.origem})"
+
+
+class TradeHistorico(models.Model):
+    acao = models.ForeignKey(Acao, on_delete=models.CASCADE)
+    data_entrada = models.DateField()
+    data_saida = models.DateField()
+    lado = models.CharField(
+        max_length=10,
+        choices=[("COMPRA", "Compra"), ("VENDA", "Venda")],
+    )
+    prob_no_momento = models.DecimalField(max_digits=6, decimal_places=4)
+    preco_entrada = models.DecimalField(max_digits=12, decimal_places=2)
+    preco_saida = models.DecimalField(max_digits=12, decimal_places=2)
+    retorno_percentual = models.DecimalField(max_digits=8, decimal_places=4)
+    resultado = models.CharField(
+        max_length=10,
+        choices=[("ALVO", "Alvo"), ("STOP", "Stop"), ("TEMPO", "Tempo")],
+    )
+    origem = models.CharField(max_length=50, default="modelo_direcional_v1")
+
+    class Meta:
+        db_table = "cotacoes_trades_historicos"
+        managed = False
+        indexes = [
+            models.Index(fields=["acao"]),
+            models.Index(fields=["lado"]),
+        ]
+
+    def __str__(self):
+        return f"{self.acao.ticker} {self.data_entrada} -> {self.data_saida} ({self.lado})"
+
+
+class EstatisticaEstrategia(models.Model):
+    acao = models.ForeignKey(Acao, on_delete=models.CASCADE, null=True, blank=True)
+    lado = models.CharField(
+        max_length=10,
+        choices=[("COMPRA", "Compra"), ("VENDA", "Venda")],
+    )
+    faixa_prob_min = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    faixa_prob_max = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+
+    numero_trades = models.IntegerField()
+    hit_rate = models.DecimalField(max_digits=6, decimal_places=2)
+    ganho_medio = models.DecimalField(max_digits=8, decimal_places=4)
+    perda_media = models.DecimalField(max_digits=8, decimal_places=4)
+    ganho_maximo = models.DecimalField(max_digits=8, decimal_places=4)
+    ganho_minimo = models.DecimalField(max_digits=8, decimal_places=4)
+    perda_maxima = models.DecimalField(max_digits=8, decimal_places=4)
+    perda_minima = models.DecimalField(max_digits=8, decimal_places=4)
+
+    origem = models.CharField(max_length=50, default="modelo_direcional_v1")
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "cotacoes_estatisticas_estrategia"
+        managed = False
+        indexes = [
+            models.Index(fields=["acao", "lado"]),
+        ]
+
+    def __str__(self):
+        acao = self.acao.ticker if self.acao else "GLOBAL"
+        return f"{acao} {self.lado} ({self.faixa_prob_min}-{self.faixa_prob_max})"
+
+
 # =======================
 # Clientes / Operações
 # =======================

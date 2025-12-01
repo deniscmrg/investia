@@ -35,7 +35,7 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import AddIcon from "@mui/icons-material/Add";
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import api from "../../services/api";
+import api, { getRecomendacoesIA } from "../../services/api";
 import OperacaoModal from "../../components/OperacaoModal";
 
 export default function Carteira() {
@@ -108,6 +108,10 @@ export default function Carteira() {
       maximumFractionDigits: 2,
     }).format(Number(value));
   };
+  const toNumberOrNull = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
 
   const calcDiasPosicionado = (op) => {
     if (op?.dias_posicionado != null) return op.dias_posicionado;
@@ -156,6 +160,20 @@ export default function Carteira() {
     const totalVenda = calcTotalVenda(op);
     if (totalCompra != null && totalVenda != null) {
       return totalVenda - totalCompra;
+    }
+    return null;
+  };
+
+  const getCotacaoReferencia = () => {
+    const candidatos = [
+      cotacaoAtual,
+      recSelecionada?.cotacao_atual,
+      recSelecionada?.preco_compra,
+      execucao === "limite" && precoLimite !== "" ? Number(precoLimite) : null,
+    ];
+    for (const val of candidatos) {
+      const num = Number(val);
+      if (!Number.isNaN(num)) return num;
     }
     return null;
   };
@@ -396,8 +414,103 @@ export default function Carteira() {
   const abrirNovaCompra = async () => {
     try {
       setOpenRecModal(true);
-      const recs = await api(`clientes/${id}/recomendacoes-disponiveis/`);
-      setRecsDisponiveis(Array.isArray(recs) ? recs : []);
+      const [recsClassicasRes, recsIaRes] = await Promise.allSettled([
+        api(`clientes/${id}/recomendacoes-disponiveis/`),
+        getRecomendacoesIA({ tipo: "todos" }),
+      ]);
+      const recsClassicas = recsClassicasRes.status === "fulfilled" ? recsClassicasRes.value : [];
+      const recsIa = recsIaRes.status === "fulfilled" ? recsIaRes.value : [];
+      if (recsClassicasRes.status === "rejected") {
+        console.error("Erro ao carregar recomendações clássicas:", recsClassicasRes.reason);
+      }
+      if (recsIaRes.status === "rejected") {
+        console.error("Erro ao carregar recomendações IA:", recsIaRes.reason);
+      }
+
+      const tickersEmAberto = new Set(
+        operacoes
+          .filter(op => !op.data_venda)
+          .map(op => (op.acao_nome || "").trim().toUpperCase())
+          .filter(Boolean)
+      );
+
+      const normalizarClassica = (r) => {
+        const ticker = (r?.ticker || "").trim().toUpperCase();
+        if (!ticker) return null;
+        const cotacao = toNumberOrNull(r?.cotacao_atual);
+        const precoCompra = cotacao != null ? cotacao : toNumberOrNull(r?.preco_compra);
+        const alvo5 = toNumberOrNull(r?.alvo_sugerido_5pct) ?? (precoCompra != null ? precoCompra * 1.05 : null);
+        const prob = toNumberOrNull(r?.probabilidade);
+        return {
+          ...r,
+          ticker,
+          empresa: r?.empresa,
+          cotacao_atual: cotacao,
+          preco_compra: precoCompra,
+          alvo_sugerido: toNumberOrNull(r?.alvo_sugerido),
+          alvo_sugerido_5pct: alvo5,
+          probabilidade: prob != null ? (prob > 1 ? prob : prob * 100) : null,
+          origem: "classica",
+          lado: "compra",
+          key: `classica-${r?.acao_id ?? ticker}`,
+        };
+      };
+
+      const normalizarIa = (r) => {
+        const ticker = (r?.acao_ticker || r?.ticker || "").trim().toUpperCase();
+        if (!ticker) return null;
+        const lado = (r?.classe || "").toUpperCase() === "DOWN_FIRST" ? "venda" : "compra";
+        const probRaw = lado === "venda" ? toNumberOrNull(r?.prob_down) : toNumberOrNull(r?.prob_up);
+        const prob = probRaw != null ? (probRaw > 1 ? probRaw : probRaw * 100) : null;
+        const precoEntrada = toNumberOrNull(r?.preco_entrada);
+        const alvoPct = toNumberOrNull(r?.alvo_percentual);
+        const alvoCalculado = precoEntrada != null && alvoPct != null
+          ? precoEntrada * (1 + (lado === "venda" ? -1 : 1) * (alvoPct / 100))
+          : null;
+        const alvo5 = alvoCalculado != null
+          ? alvoCalculado
+          : (precoEntrada != null ? precoEntrada * (lado === "venda" ? 0.95 : 1.05) : null);
+        return {
+          acao_id: r?.acao,
+          ticker,
+          empresa: r?.acao_empresa,
+          cotacao_atual: precoEntrada,
+          preco_compra: precoEntrada,
+          alvo_sugerido: alvoCalculado,
+          alvo_sugerido_5pct: alvo5,
+          probabilidade: prob,
+          origem: "ia",
+          lado,
+          key: `ia-${r?.id ?? ticker}-${lado}`,
+        };
+      };
+
+      const listaClassica = Array.isArray(recsClassicas) ? recsClassicas.map(normalizarClassica).filter(Boolean) : [];
+      const listaIa = Array.isArray(recsIa) ? recsIa.map(normalizarIa).filter(Boolean) : [];
+
+      const mergedMap = new Map();
+      [...listaClassica, ...listaIa].forEach((rec) => {
+        const ticker = (rec.ticker || "").toUpperCase();
+        if (!ticker || tickersEmAberto.has(ticker)) return;
+        const key = `${ticker}|${rec.lado || "?"}`;
+        const existente = mergedMap.get(key);
+        if (existente) {
+          mergedMap.set(key, { ...rec, ...existente, key });
+        } else {
+          mergedMap.set(key, { ...rec, key });
+        }
+      });
+
+      const ordenada = Array.from(mergedMap.values()).sort((a, b) => {
+        const at = (a?.ticker || "").toUpperCase();
+        const bt = (b?.ticker || "").toUpperCase();
+        const cmpTicker = at.localeCompare(bt, undefined, { sensitivity: "base" });
+        if (cmpTicker !== 0) return cmpTicker;
+        const al = (a?.lado || "").toUpperCase();
+        const bl = (b?.lado || "").toUpperCase();
+        return al.localeCompare(bl, undefined, { sensitivity: "base" });
+      });
+      setRecsDisponiveis(ordenada);
     } catch (e) {
       console.error("Erro ao carregar recomendações:", e);
       setRecsDisponiveis([]);
@@ -408,7 +521,11 @@ export default function Carteira() {
     setRecSelecionada(item);
     setOpenRecModal(false);
     const cot = item?.cotacao_atual != null ? Number(item.cotacao_atual) : (item?.preco_compra != null ? Number(item.preco_compra) : null);
-    const alvoSug = cot != null ? cot * 1.05 : (item?.alvo_sugerido != null ? Number(item.alvo_sugerido) : null);
+    const alvoSug = item?.alvo_sugerido_5pct != null
+      ? Number(item.alvo_sugerido_5pct)
+      : (cot != null
+        ? cot * 1.05
+        : (item?.alvo_sugerido != null ? Number(item.alvo_sugerido) : null));
     setCotacaoAtual(cot);
     setAlvoSugerido5(alvoSug);
     setCotacaoAtualLoading(false);
@@ -488,6 +605,10 @@ export default function Carteira() {
 
   const enviarCompra = async () => {
     if (!recSelecionada || !Array.isArray(legsSugeridas) || legsSugeridas.length === 0) return;
+    if (valorMaxCompra != null && valorEstimadoTotal != null && valorEstimadoTotal > valorMaxCompra) {
+      mostrarAlerta("Valor estimado da compra excede o VALOR MÁX permitido para o cliente.", "warning");
+      return;
+    }
     setComprando(true);
     try {
       const body = {
@@ -547,6 +668,32 @@ export default function Carteira() {
     operacoesFiltradas = operacoesDoCliente.filter(op => op.data_venda);  // REALIZADAS
   }
   const sortedOperacoes = stableSort(operacoesFiltradas, getComparator(order, orderBy));
+
+  const percentualLiberado = cliente?.percentual_patrimonio != null ? Number(cliente.percentual_patrimonio) : null;
+  const patrimonioCliente = resumo?.patrimonio != null ? Number(resumo.patrimonio) : null;
+  const valorDisponivelAplicacao = resumo?.valor_disponivel != null
+    ? Number(resumo.valor_disponivel)
+    : (patrimonioCliente != null && percentualLiberado != null
+      ? patrimonioCliente * (percentualLiberado / 100)
+      : null);
+  const baseValorMaximo = patrimonioCliente != null && percentualLiberado != null
+    ? patrimonioCliente * (percentualLiberado / 100)
+    : valorDisponivelAplicacao;
+  const valorMaxCompra = baseValorMaximo != null
+    ? (baseValorMaximo / 10) * 1.05
+    : null;
+
+  const precoEstimativa = getCotacaoReferencia();
+  const valorEstimadoLegs = (legsSugeridas || []).map((l) => {
+    const qtd = Number(l?.quantidade);
+    const valor = !Number.isNaN(qtd) && precoEstimativa != null ? qtd * precoEstimativa : null;
+    return { symbol: l?.symbol, valorEstimado: valor };
+  });
+  const possuiEstimativas = valorEstimadoLegs.some((l) => l.valorEstimado != null);
+  const valorEstimadoTotal = possuiEstimativas
+    ? valorEstimadoLegs.reduce((acc, l) => acc + (l.valorEstimado || 0), 0)
+    : null;
+  const excedeValorMaximo = valorMaxCompra != null && valorEstimadoTotal != null && valorEstimadoTotal > valorMaxCompra;
 
   return (
     <Box sx={{ mt: 12, px: 4 }}>
@@ -964,6 +1111,8 @@ export default function Carteira() {
             <TableHead>
               <TableRow>
                 <TableCell>Ticker</TableCell>
+                <TableCell>Tipo</TableCell>
+                <TableCell>Origem</TableCell>
                 <TableCell>Empresa</TableCell>
                 <TableCell align="right">Cotação atual</TableCell>
                 <TableCell align="right">Alvo sugerido (5%)</TableCell>
@@ -975,13 +1124,20 @@ export default function Carteira() {
               {recsDisponiveis.map((r) => {
                 const cotRef = r.cotacao_atual != null ? Number(r.cotacao_atual) : (r.preco_compra != null ? Number(r.preco_compra) : null);
                 const alvo5 = r.alvo_sugerido_5pct != null ? Number(r.alvo_sugerido_5pct) : (cotRef != null ? cotRef * 1.05 : null);
+                const probLabel = r.probabilidade != null
+                  ? `${Number(r.probabilidade).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`
+                  : "-";
+                const tipoLabel = (r.lado || "").toLowerCase() === "venda" ? "Venda" : "Compra";
+                const origemLabel = r.origem === "ia" ? "IA" : "Clássica";
                 return (
-                  <TableRow key={r.acao_id}>
+                  <TableRow key={r.key || r.acao_id || r.ticker}>
                     <TableCell>{r.ticker}</TableCell>
+                    <TableCell>{tipoLabel}</TableCell>
+                    <TableCell>{origemLabel}</TableCell>
                     <TableCell>{r.empresa}</TableCell>
                     <TableCell align="right">{formatCurrency(cotRef)}</TableCell>
                     <TableCell align="right">{formatCurrency(alvo5)}</TableCell>
-                    <TableCell align="right">{r.probabilidade}%</TableCell>
+                    <TableCell align="right">{probLabel}</TableCell>
                     <TableCell>
                       <Button variant="contained" size="small" onClick={() => confirmarRecomendacao(r)}>Selecionar</Button>
                     </TableCell>
@@ -1000,7 +1156,14 @@ export default function Carteira() {
       <Dialog open={openNovaCompraModal} onClose={() => setOpenNovaCompraModal(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Nova Compra (MT5) — {recSelecionada?.ticker}</DialogTitle>
         <DialogContent>
-          <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mt: 1 }}>
+          <Stack spacing={0.5} sx={{ mt: 1 }}>
+            <Typography variant="subtitle2">{cliente?.nome || "-"}</Typography>
+            <Typography variant="body2"><strong>Patrimônio:</strong> R$ {formatCurrency(patrimonioCliente)}</Typography>
+            <Typography variant="body2"><strong>% liberado:</strong> {percentualLiberado != null ? `${percentualLiberado}%` : "-"}</Typography>
+            <Typography variant="body2"><strong>Disponível pelo %:</strong> R$ {formatCurrency(valorDisponivelAplicacao)}</Typography>
+            <Typography variant="body2"><strong>VALOR MÁX desta compra:</strong> R$ {formatCurrency(valorMaxCompra)}</Typography>
+          </Stack>
+          <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mt: 2 }}>
             <Typography variant="body2"><strong>Cotação atual:</strong> {cotacaoAtual != null ? `R$ ${formatCurrency(cotacaoAtual)}` : "-"}</Typography>
             <Typography variant="body2"><strong>Alvo sugerido (5%):</strong> {alvoSugerido5 != null ? `R$ ${formatCurrency(alvoSugerido5)}` : "-"}</Typography>
             <Tooltip title={cotacaoAtualLoading ? "Atualizando..." : "Atualizar cotação"}>
@@ -1043,15 +1206,35 @@ export default function Carteira() {
               <Chip label={`Legs: ${legsSugeridas.length}`} />
             </Stack>
 
-            {legsSugeridas.map((l, idx) => (
-              <Stack key={`${l.symbol}-${idx}`} direction="row" spacing={2} alignItems="center">
-                <TextField label="Símbolo" value={l.symbol} size="small" InputProps={{ readOnly: true }} />
-                <TextField label="Quantidade" type="number" value={l.quantidade} size="small" onChange={(e) => {
-                  const v = e.target.value;
-                  setLegsSugeridas((old) => old.map((x, i) => i === idx ? { ...x, quantidade: v } : x));
-                }} />
-              </Stack>
-            ))}
+            {legsSugeridas.map((l, idx) => {
+              const valorLeg = valorEstimadoLegs[idx]?.valorEstimado;
+              return (
+                <Stack key={`${l.symbol}-${idx}`} direction="row" spacing={2} alignItems="center">
+                  <TextField label="Símbolo" value={l.symbol} size="small" InputProps={{ readOnly: true }} />
+                  <TextField label="Quantidade" type="number" value={l.quantidade} size="small" onChange={(e) => {
+                    const v = e.target.value;
+                    setLegsSugeridas((old) => old.map((x, i) => i === idx ? { ...x, quantidade: v } : x));
+                  }} />
+                  <TextField
+                    label="Valor estimado (R$)"
+                    value={valorLeg != null ? formatCurrency(valorLeg) : "-"}
+                    size="small"
+                    InputProps={{ readOnly: true }}
+                  />
+                </Stack>
+              );
+            })}
+
+            {valorEstimadoTotal != null && (
+              <Typography variant="body2" color={excedeValorMaximo ? "error" : "text.primary"}>
+                Valor estimado total: R$ {formatCurrency(valorEstimadoTotal)} {excedeValorMaximo ? "(acima do VALOR MÁX)" : ""}
+              </Typography>
+            )}
+            {valorMaxCompra != null && (
+              <Typography variant="caption" color={excedeValorMaximo ? "error" : "text.secondary"}>
+                VALOR MÁX permitido: R$ {formatCurrency(valorMaxCompra)}
+              </Typography>
+            )}
 
             {validacoesLegs?.length > 0 && (
               <Stack spacing={0.5}>
@@ -1077,7 +1260,7 @@ export default function Carteira() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenNovaCompraModal(false)} disabled={comprando}>Cancelar</Button>
-          <Button variant="contained" onClick={enviarCompra} disabled={comprando || legsSugeridas.length === 0}>Enviar</Button>
+          <Button variant="contained" onClick={enviarCompra} disabled={comprando || legsSugeridas.length === 0 || excedeValorMaximo}>Enviar</Button>
         </DialogActions>
       </Dialog>
 

@@ -3,7 +3,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from core.views import ( MyTokenObtainPairView, perfil_usuario, logout_view, ClienteViewSet, 
-                        OperacaoCarteiraViewSet, AcaoViewSet, cotacoes_atuais, dashboard_rv, 
+                        OperacaoCarteiraViewSet, AcaoViewSet, RecomendacaoIAViewSet, cotacoes_atuais, dashboard_rv, 
                         ImportacaoUploadView, carteira_resumo, patrimonio_disponivel, recomendacoes_api,
                         clientes_mt5_status,
                         recomendacoes_disponiveis,
@@ -22,6 +22,7 @@ router = DefaultRouter()
 router.register(r'clientes', ClienteViewSet, basename='clientes')
 router.register(r'operacoes', OperacaoCarteiraViewSet, basename='operacoes')
 router.register(r'acoes', AcaoViewSet, basename='acoes')
+router.register(r'recomendacoes-ia', RecomendacaoIAViewSet, basename='recomendacoes-ia')
 
 urlpatterns = [
     path('admin/', admin.site.urls),

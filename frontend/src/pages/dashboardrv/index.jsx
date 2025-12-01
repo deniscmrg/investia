@@ -18,7 +18,7 @@ import {
 } from "@mui/material";
 import { Chip } from "@mui/material";
 import * as XLSX from "xlsx";
-import api from "../../services/api";
+import api, { getRecomendacoesIA } from "../../services/api";
 import { useNavigate } from "react-router-dom";
 import OperacaoModal from "../../components/OperacaoModal";
 
@@ -66,6 +66,17 @@ const formatPercentBR = (v) =>
         maximumFractionDigits: 2,
       })}%`;
 
+const getVariacaoDiaColor = (v) => {
+  const num = Number(v);
+  if (!Number.isFinite(num) || num === 0) return undefined;
+  return num > 0 ? "success.main" : "error.main";
+};
+
+const normalizeStatusLabel = (val) => {
+  if (!val || val === "manual") return "n/d";
+  return val;
+};
+
 export default function DashboardRV() {
   const navigate = useNavigate();
   const [tabIndex, setTabIndex] = useState(0);
@@ -80,6 +91,16 @@ export default function DashboardRV() {
   const [operacaoSelecionada, setOperacaoSelecionada] = useState(null);
   const [operacaoCliente, setOperacaoCliente] = useState({ id: null, nome: "" });
   const [operacaoCarregandoId, setOperacaoCarregandoId] = useState(null);
+
+  // Recomendações IA direcionais
+  const [iaCompras, setIaCompras] = useState([]);
+  const [iaVendas, setIaVendas] = useState([]);
+  const [iaLoading, setIaLoading] = useState(false);
+  const [iaMinProb, setIaMinProb] = useState(0.4);
+  const [iaOrderCompra, setIaOrderCompra] = useState("asc");
+  const [iaOrderByCompra, setIaOrderByCompra] = useState("acao_ticker");
+  const [iaOrderVenda, setIaOrderVenda] = useState("asc");
+  const [iaOrderByVenda, setIaOrderByVenda] = useState("acao_ticker");
 
   // filtros
   const [filtroCliente, setFiltroCliente] = useState("");
@@ -108,25 +129,69 @@ export default function DashboardRV() {
     setOrderRec(isAsc ? "desc" : "asc");
     setOrderByRec(property);
   };
+  const handleRequestSortIaCompra = (property) => {
+    const isAsc =
+      iaOrderByCompra === property && iaOrderCompra === "asc";
+    setIaOrderCompra(isAsc ? "desc" : "asc");
+    setIaOrderByCompra(property);
+  };
+  const handleRequestSortIaVenda = (property) => {
+    const isAsc = iaOrderByVenda === property && iaOrderVenda === "asc";
+    setIaOrderVenda(isAsc ? "desc" : "asc");
+    setIaOrderByVenda(property);
+  };
 
   const fetchDashboard = async () => {
+    setLoading(true);
     try {
-      setLoading(true);
-      const res1 = await api("dashboard-rv/");
-      setPosicionadas(res1.posicionadas || []);
-      const res2 = await api("patrimonio-disponivel/");
+      const [res1, res2, res3] = await Promise.all([
+        api("dashboard-rv/"),
+        api("patrimonio-disponivel/"),
+        api("recomendacoes/"),
+      ]);
+      const posicoes = res1?.posicionadas || [];
+      setPosicionadas(posicoes);
+      const statusMap = {};
+      posicoes.forEach((op) => {
+        if (op?.id == null) return;
+        const status = normalizeStatusLabel(op.status);
+        if (status) {
+          statusMap[op.id] = status;
+        }
+      });
+      setStatusById(statusMap);
       setPatrimonio(res2 || []);
-      const res3 = await api("recomendacoes/");
       setRecs(res3 || []);
     } catch (err) {
       console.error("Erro ao buscar dashboard RV:", err);
+      setPosicionadas([]);
+      setPatrimonio([]);
+      setRecs([]);
+      setStatusById({});
     } finally {
       setLoading(false);
     }
   };
 
+  const fetchRecsIA = async () => {
+    setIaLoading(true);
+    try {
+      const [compras, vendas] = await Promise.all([
+        getRecomendacoesIA({ tipo: "compra", minProb: iaMinProb }),
+        getRecomendacoesIA({ tipo: "venda", minProb: iaMinProb }),
+      ]);
+      setIaCompras(compras || []);
+      setIaVendas(vendas || []);
+    } catch (err) {
+      console.error("Erro ao buscar recomendações IA:", err);
+    } finally {
+      setIaLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetchDashboard();
+    fetchRecsIA();
   }, []);
 
   useEffect(() => {
@@ -141,68 +206,20 @@ export default function DashboardRV() {
     loadAcoes();
   }, []);
 
-  // carrega quantidade total de ações posicionadas por cliente
+  // quantidade de ações posicionadas por cliente calculada localmente
   useEffect(() => {
-    const loadQtdPosicionadas = async () => {
-      try {
-        const ids = Array.from(new Set((patrimonio || []).map((p) => p.codigo).filter(Boolean)));
-        if (!ids.length) {
-          setQtdPosicionadasByCliente({});
-          return;
-        }
-        const results = await Promise.all(ids.map(async (id) => {
-          try {
-            const res = await api(`operacoes/?cliente=${id}`);
-            const lista = res?.results || res || [];
-            const abertos = lista.filter((op) => !op.data_venda);
-            const symbols = new Set(
-              abertos
-                .map((op) => {
-                  const raw = op.acao_nome ?? op.acao ?? op.ticker ?? op.symbol;
-                  if (raw == null) return null;
-                  return String(raw).trim().toUpperCase();
-                })
-                .filter(Boolean)
-            );
-            return [id, symbols.size];
-          } catch (e) {
-            return [id, 0];
-          }
-        }));
-        setQtdPosicionadasByCliente(Object.fromEntries(results));
-      } catch (e) {
-        // silencioso
-      }
-    };
-    loadQtdPosicionadas();
-  }, [patrimonio]);
-
-  // busca status por operação (GET operacoes/<id>/), usa serializer com 'status'
-  useEffect(() => {
-    const loadStatuses = async () => {
-      try {
-        const ids = Array.from(new Set((posicionadas || []).map((p) => p.id).filter(Boolean)));
-        if (!ids.length) {
-          setStatusById({});
-          return;
-        }
-        const results = await Promise.all(ids.map(async (id) => {
-          try {
-            const res = await api(`operacoes/${id}/`);
-            const raw = res?.status;
-            const label = raw && raw !== 'manual' ? String(raw) : 'n/d';
-            return [id, label];
-          } catch (e) {
-            return [id, 'n/d'];
-          }
-        }));
-        const map = Object.fromEntries(results);
-        setStatusById(map);
-      } catch (e) {
-        // silencioso
-      }
-    };
-    loadStatuses();
+    const map = {};
+    (posicionadas || []).forEach((op) => {
+      const clienteId = op.cliente_id ?? op.cliente;
+      const ticker = (op.acao ?? op.ticker ?? op.acao_nome ?? "").toString().trim().toUpperCase();
+      if (!clienteId || !ticker) return;
+      if (!map[clienteId]) map[clienteId] = new Set();
+      map[clienteId].add(ticker);
+    });
+    const counts = Object.fromEntries(
+      Object.entries(map).map(([id, set]) => [id, set.size])
+    );
+    setQtdPosicionadasByCliente(counts);
   }, [posicionadas]);
 
   const renderStatusChip = (label) => {
@@ -277,6 +294,11 @@ export default function DashboardRV() {
     { id: "empresa", label: "Empresa" },
     { id: "setor", label: "Setor" },
     { id: "data", label: "Data" },
+    {
+      id: "variacao_dia",
+      label: "% Hoje (atual/abertura)",
+      type: "percent",
+    },
     { id: "preco_compra", label: "Preço compra", type: "currency" },
     { id: "alvo_sugerido", label: "Alvo sugerido", type: "currency" },
     { id: "percentual_estimado", label: "% Estimado", type: "percent" },
@@ -315,6 +337,14 @@ export default function DashboardRV() {
     }
   };
   const sortedRecs = stableSort(recs || [], getComparator(orderRec, orderByRec));
+   const sortedIaCompras = stableSort(
+    iaCompras || [],
+    getComparator(iaOrderCompra, iaOrderByCompra)
+  );
+  const sortedIaVendas = stableSort(
+    iaVendas || [],
+    getComparator(iaOrderVenda, iaOrderByVenda)
+  );
 
   // --- gera listas únicas de clientes e ações
   const clientesUnicos = [...new Set(posicionadas.map((p) => p.cliente))];
@@ -368,7 +398,7 @@ export default function DashboardRV() {
       formatPercentBR(op.lucro_percentual),
       formatCurrencyBRL(op.valor_alvo),
       op.dias_posicionado ?? "-",
-      statusById[op.id] || "n/d",
+      normalizeStatusLabel(op.status ?? statusById[op.id]),
     ]);
 
     const worksheet = XLSX.utils.aoa_to_sheet([headers, ...linhas]);
@@ -552,7 +582,9 @@ export default function DashboardRV() {
                       {formatCurrencyBRL(valorAlvo)}
                     </TableCell>
                     <TableCell>{op.dias_posicionado ?? "-"}</TableCell>
-                    <TableCell>{renderStatusChip(statusById[op.id] || 'n/d')}</TableCell>
+                    <TableCell>
+                      {renderStatusChip(normalizeStatusLabel(op.status ?? statusById[op.id]))}
+                    </TableCell>
                     <TableCell>
                       <Button
                         size="small"
@@ -653,72 +685,848 @@ export default function DashboardRV() {
       )}
 
       {/* =================== RECOMENDAÇÕES =================== */}
-     {tabIndex === 2 && (
-      <Box>
-        {/* Botão Atualizar */}
-        <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={async () => {
-              setLoading(true);
-              try {
-                await api("recomendacoes/", { method: "POST" });
-                const res = await api("recomendacoes/");
-                setRecs(res || []);
-              } catch (err) {
-                console.error("Erro ao atualizar recomendações:", err);
-              } finally {
-                setLoading(false);
-              }
-            }}
-          >
-            🔄 Atualizar
-          </Button>
-        </Box>
+      {tabIndex === 2 && (
+        <Box>
+          {/* Botão Atualizar recomendações clássicas */}
+          <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={async () => {
+                setLoading(true);
+                try {
+                  await api("recomendacoes/", { method: "POST" });
+                  const res = await api("recomendacoes/");
+                  setRecs(res || []);
+                } catch (err) {
+                  console.error("Erro ao atualizar recomendações:", err);
+                } finally {
+                  setLoading(false);
+                }
+              }}
+            >
+              🔄 Atualizar
+            </Button>
+          </Box>
 
-        <Box sx={{ '& .MuiTableCell-root': { fontSize: '0.79rem' } }}>
-        <Table>
-          <TableHead>
-            <TableRow>
-              {recColumns.map((col) => (
-                <TableCell
-                  key={col.id}
-                  sortDirection={orderByRec === col.id ? orderRec : false}
-                >
-                  <TableSortLabel
-                    active={orderByRec === col.id}
-                    direction={orderByRec === col.id ? orderRec : "asc"}
-                    onClick={() => handleRequestSortRecs(col.id)}
-                  >
-                    {col.label}
-                  </TableSortLabel>
-                </TableCell>
-              ))}
-            </TableRow>
-          </TableHead>
-
-          <TableBody>
-            {sortedRecs.length ? (
-              sortedRecs.map((r, i) => (
-                <TableRow key={i}>
+          {/* Tabela de recomendações atuais (modelo antigo) */}
+          <Box sx={{ "& .MuiTableCell-root": { fontSize: "0.79rem" } }}>
+            <Table>
+              <TableHead>
+                <TableRow>
                   {recColumns.map((col) => (
-                    <TableCell key={col.id}>{formatRecCell(r, col)}</TableCell>
+                    <TableCell
+                      key={col.id}
+                      sortDirection={orderByRec === col.id ? orderRec : false}
+                    >
+                      <TableSortLabel
+                        active={orderByRec === col.id}
+                        direction={orderByRec === col.id ? orderRec : "asc"}
+                        onClick={() => handleRequestSortRecs(col.id)}
+                      >
+                        {col.label}
+                      </TableSortLabel>
+                    </TableCell>
                   ))}
                 </TableRow>
-              ))
+              </TableHead>
+
+              <TableBody>
+                {sortedRecs.length ? (
+                  sortedRecs.map((r, i) => (
+                    <TableRow key={i}>
+                      {recColumns.map((col) => {
+                        const rawVal = r?.[col.id];
+                        const color =
+                          col.id === "variacao_dia"
+                            ? getVariacaoDiaColor(rawVal)
+                            : undefined;
+                        return (
+                          <TableCell
+                            key={col.id}
+                            sx={color ? { color } : undefined}
+                          >
+                            {formatRecCell(r, col)}
+                          </TableCell>
+                        );
+                      })}
+                    </TableRow>
+                  ))
+                ) : (
+                  <TableRow>
+                    <TableCell colSpan={recColumns.length} align="center">
+                      Nenhuma recomendação encontrada.
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Box>
+
+          {/* Seção de Recomendações IA Direcionais */}
+          <Box sx={{ mt: 6 }}>
+            <Typography variant="h6" mb={2}>
+              🤖 Recomendações IA Direcional (+5% / -5% em 10 pregões)
+            </Typography>
+
+            <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+              <TextField
+                label="Prob. mínima"
+                type="number"
+                size="small"
+                value={iaMinProb}
+                onChange={(e) => setIaMinProb(Number(e.target.value) || 0)}
+                inputProps={{ step: 0.05, min: 0, max: 1 }}
+                sx={{ maxWidth: 160 }}
+              />
+              <Button variant="outlined" onClick={fetchRecsIA}>
+                Atualizar IA
+              </Button>
+            </Box>
+
+            {iaLoading ? (
+              <CircularProgress />
             ) : (
-              <TableRow>
-                <TableCell colSpan={recColumns.length} align="center">
-                  Nenhuma recomendação encontrada.
-                </TableCell>
-              </TableRow>
+              <Box sx={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                <Box sx={{ flex: 1, minWidth: 320 }}>
+                  <Typography variant="subtitle1" mb={1}>
+                    Compras (UP_FIRST)
+                  </Typography>
+                  <Table size="small">
+                    <TableHead>
+                  <TableRow>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "acao_ticker"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "acao_ticker"}
+                        direction={
+                          iaOrderByCompra === "acao_ticker"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("acao_ticker")
+                        }
+                      >
+                        Ticker
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "prob_up"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "prob_up"}
+                        direction={
+                          iaOrderByCompra === "prob_up"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("prob_up")
+                        }
+                      >
+                        Prob. UP
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "preco_entrada"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "preco_entrada"}
+                        direction={
+                          iaOrderByCompra === "preco_entrada"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("preco_entrada")
+                        }
+                      >
+                        Preço entrada
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "variacao_dia"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "variacao_dia"}
+                        direction={
+                          iaOrderByCompra === "variacao_dia"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("variacao_dia")
+                        }
+                      >
+                        Var. dia (%)
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "dias_equivalentes_selic"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={
+                          iaOrderByCompra === "dias_equivalentes_selic"
+                        }
+                        direction={
+                          iaOrderByCompra === "dias_equivalentes_selic"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra(
+                            "dias_equivalentes_selic"
+                          )
+                        }
+                      >
+                        Dias SELIC
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "retorno_medio_selic_ativo"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={
+                          iaOrderByCompra === "retorno_medio_selic_ativo"
+                        }
+                        direction={
+                          iaOrderByCompra === "retorno_medio_selic_ativo"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra(
+                            "retorno_medio_selic_ativo"
+                          )
+                        }
+                      >
+                        Ret. médio SELIC ativo
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "qtd_testes"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "qtd_testes"}
+                        direction={
+                          iaOrderByCompra === "qtd_testes"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("qtd_testes")
+                        }
+                      >
+                        Qtd testes
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "qtd_acertos"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "qtd_acertos"}
+                        direction={
+                          iaOrderByCompra === "qtd_acertos"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("qtd_acertos")
+                        }
+                      >
+                        Qtd acertos
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "hit_rate"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "hit_rate"}
+                        direction={
+                          iaOrderByCompra === "hit_rate"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("hit_rate")
+                        }
+                      >
+                        Hit rate
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "maior_ganho_10d"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "maior_ganho_10d"}
+                        direction={
+                          iaOrderByCompra === "maior_ganho_10d"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("maior_ganho_10d")
+                        }
+                      >
+                        Maior ganho 10d
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "maior_perda_10d"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "maior_perda_10d"}
+                        direction={
+                          iaOrderByCompra === "maior_perda_10d"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("maior_perda_10d")
+                        }
+                      >
+                        Maior perda 10d
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell
+                      sortDirection={
+                        iaOrderByCompra === "acao_setor"
+                          ? iaOrderCompra
+                          : false
+                      }
+                    >
+                      <TableSortLabel
+                        active={iaOrderByCompra === "acao_setor"}
+                        direction={
+                          iaOrderByCompra === "acao_setor"
+                            ? iaOrderCompra
+                            : "asc"
+                        }
+                        onClick={() =>
+                          handleRequestSortIaCompra("acao_setor")
+                        }
+                      >
+                        Setor
+                      </TableSortLabel>
+                    </TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {sortedIaCompras && sortedIaCompras.length ? (
+                        sortedIaCompras.map((rec) => (
+                      <TableRow key={rec.id}>
+                        <TableCell>{rec.acao_ticker}</TableCell>
+                        <TableCell
+                          sx={{
+                            color: getVariacaoDiaColor(rec.variacao_dia),
+                          }}
+                        >
+                              {Number(rec.prob_up || 0).toLocaleString(
+                                "pt-BR",
+                                {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                }
+                              )}
+                        </TableCell>
+                        <TableCell>
+                          {Number(rec.preco_entrada || 0).toLocaleString(
+                            "pt-BR",
+                            {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            }
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {rec.variacao_dia != null
+                            ? `${Number(rec.variacao_dia).toLocaleString(
+                                "pt-BR",
+                                {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                }
+                              )}%`
+                            : "-"}
+                        </TableCell>
+                            <TableCell>
+                              {rec.dias_equivalentes_selic ?? "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.retorno_medio_selic_ativo != null
+                                ? `${Number(
+                                    rec.retorno_medio_selic_ativo * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>{rec.qtd_testes ?? "-"}</TableCell>
+                            <TableCell>{rec.qtd_acertos ?? "-"}</TableCell>
+                            <TableCell>
+                              {rec.hit_rate != null
+                                ? `${Number(rec.hit_rate).toLocaleString(
+                                    "pt-BR",
+                                    {
+                                      minimumFractionDigits: 2,
+                                      maximumFractionDigits: 2,
+                                    }
+                                  )}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.maior_ganho_10d != null
+                                ? `${Number(
+                                    rec.maior_ganho_10d * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.maior_perda_10d != null
+                                ? `${Number(
+                                    rec.maior_perda_10d * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>{rec.acao_setor || "-"}</TableCell>
+                          </TableRow>
+                        ))
+                      ) : (
+                        <TableRow>
+                          <TableCell colSpan={12} align="center">
+                            Nenhuma recomendação de compra.
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </Box>
+
+                <Box sx={{ flex: 1, minWidth: 320 }}>
+                  <Typography variant="subtitle1" mb={1}>
+                    Vendas (DOWN_FIRST)
+                  </Typography>
+                  <Table size="small">
+                    <TableHead>
+                    <TableRow>
+                      <TableCell
+                        sortDirection={
+                          iaOrderByVenda === "acao_ticker"
+                            ? iaOrderVenda
+                            : false
+                        }
+                      >
+                        <TableSortLabel
+                          active={iaOrderByVenda === "acao_ticker"}
+                          direction={
+                            iaOrderByVenda === "acao_ticker"
+                              ? iaOrderVenda
+                              : "asc"
+                          }
+                          onClick={() =>
+                            handleRequestSortIaVenda("acao_ticker")
+                          }
+                        >
+                          Ticker
+                        </TableSortLabel>
+                      </TableCell>
+                      <TableCell
+                        sortDirection={
+                          iaOrderByVenda === "prob_down"
+                            ? iaOrderVenda
+                            : false
+                        }
+                      >
+                        <TableSortLabel
+                          active={iaOrderByVenda === "prob_down"}
+                          direction={
+                            iaOrderByVenda === "prob_down"
+                              ? iaOrderVenda
+                              : "asc"
+                          }
+                          onClick={() =>
+                            handleRequestSortIaVenda("prob_down")
+                          }
+                        >
+                          Prob. DOWN
+                        </TableSortLabel>
+                      </TableCell>
+                      <TableCell
+                        sortDirection={
+                          iaOrderByVenda === "preco_entrada"
+                            ? iaOrderVenda
+                            : false
+                        }
+                      >
+                        <TableSortLabel
+                          active={iaOrderByVenda === "preco_entrada"}
+                          direction={
+                            iaOrderByVenda === "preco_entrada"
+                              ? iaOrderVenda
+                              : "asc"
+                          }
+                          onClick={() =>
+                            handleRequestSortIaVenda("preco_entrada")
+                          }
+                        >
+                          Preço entrada
+                        </TableSortLabel>
+                      </TableCell>
+                      <TableCell
+                        sortDirection={
+                          iaOrderByVenda === "variacao_dia"
+                            ? iaOrderVenda
+                            : false
+                        }
+                      >
+                        <TableSortLabel
+                          active={iaOrderByVenda === "variacao_dia"}
+                          direction={
+                            iaOrderByVenda === "variacao_dia"
+                              ? iaOrderVenda
+                              : "asc"
+                          }
+                          onClick={() =>
+                            handleRequestSortIaVenda("variacao_dia")
+                          }
+                        >
+                          Var. dia (%)
+                        </TableSortLabel>
+                      </TableCell>
+                      <TableCell
+                        sortDirection={
+                          iaOrderByVenda === "dias_equivalentes_selic"
+                            ? iaOrderVenda
+                            : false
+                        }
+                      >
+                        <TableSortLabel
+                          active={
+                            iaOrderByVenda === "dias_equivalentes_selic"
+                          }
+                          direction={
+                            iaOrderByVenda === "dias_equivalentes_selic"
+                              ? iaOrderVenda
+                              : "asc"
+                          }
+                          onClick={() =>
+                            handleRequestSortIaVenda(
+                              "dias_equivalentes_selic"
+                            )
+                          }
+                        >
+                          Dias SELIC
+                        </TableSortLabel>
+                      </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "retorno_medio_selic_ativo"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={
+                              iaOrderByVenda === "retorno_medio_selic_ativo"
+                            }
+                            direction={
+                              iaOrderByVenda ===
+                              "retorno_medio_selic_ativo"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda(
+                                "retorno_medio_selic_ativo"
+                              )
+                            }
+                          >
+                            Ret. médio SELIC ativo
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "qtd_testes"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "qtd_testes"}
+                            direction={
+                              iaOrderByVenda === "qtd_testes"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("qtd_testes")
+                            }
+                          >
+                            Qtd testes
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "qtd_acertos"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "qtd_acertos"}
+                            direction={
+                              iaOrderByVenda === "qtd_acertos"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("qtd_acertos")
+                            }
+                          >
+                            Qtd acertos
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "hit_rate"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "hit_rate"}
+                            direction={
+                              iaOrderByVenda === "hit_rate"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("hit_rate")
+                            }
+                          >
+                            Hit rate
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "maior_ganho_10d"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "maior_ganho_10d"}
+                            direction={
+                              iaOrderByVenda === "maior_ganho_10d"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("maior_ganho_10d")
+                            }
+                          >
+                            Maior ganho 10d
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "maior_perda_10d"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "maior_perda_10d"}
+                            direction={
+                              iaOrderByVenda === "maior_perda_10d"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("maior_perda_10d")
+                            }
+                          >
+                            Maior perda 10d
+                          </TableSortLabel>
+                        </TableCell>
+                        <TableCell
+                          sortDirection={
+                            iaOrderByVenda === "acao_setor"
+                              ? iaOrderVenda
+                              : false
+                          }
+                        >
+                          <TableSortLabel
+                            active={iaOrderByVenda === "acao_setor"}
+                            direction={
+                              iaOrderByVenda === "acao_setor"
+                                ? iaOrderVenda
+                                : "asc"
+                            }
+                            onClick={() =>
+                              handleRequestSortIaVenda("acao_setor")
+                            }
+                          >
+                            Setor
+                          </TableSortLabel>
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {sortedIaVendas && sortedIaVendas.length ? (
+                        sortedIaVendas.map((rec) => (
+                        <TableRow key={rec.id}>
+                          <TableCell>{rec.acao_ticker}</TableCell>
+                            <TableCell>
+                              {Number(rec.prob_down || 0).toLocaleString(
+                                "pt-BR",
+                                {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                }
+                              )}
+                            </TableCell>
+                          <TableCell
+                            sx={{
+                              color: getVariacaoDiaColor(rec.variacao_dia),
+                            }}
+                          >
+                            {Number(rec.preco_entrada || 0).toLocaleString(
+                              "pt-BR",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            {rec.variacao_dia != null
+                              ? `${Number(rec.variacao_dia).toLocaleString(
+                                  "pt-BR",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}%`
+                              : "-"}
+                          </TableCell>
+                            <TableCell>
+                              {rec.dias_equivalentes_selic ?? "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.retorno_medio_selic_ativo != null
+                                ? `${Number(
+                                    rec.retorno_medio_selic_ativo * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>{rec.qtd_testes ?? "-"}</TableCell>
+                            <TableCell>{rec.qtd_acertos ?? "-"}</TableCell>
+                            <TableCell>
+                              {rec.hit_rate != null
+                                ? `${Number(rec.hit_rate).toLocaleString(
+                                    "pt-BR",
+                                    {
+                                      minimumFractionDigits: 2,
+                                      maximumFractionDigits: 2,
+                                    }
+                                  )}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.maior_ganho_10d != null
+                                ? `${Number(
+                                    rec.maior_ganho_10d * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>
+                              {rec.maior_perda_10d != null
+                                ? `${Number(
+                                    rec.maior_perda_10d * 100
+                                  ).toLocaleString("pt-BR", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}%`
+                                : "-"}
+                            </TableCell>
+                            <TableCell>{rec.acao_setor || "-"}</TableCell>
+                          </TableRow>
+                        ))
+                      ) : (
+                        <TableRow>
+                          <TableCell colSpan={12} align="center">
+                            Nenhuma recomendação de venda.
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </Box>
+              </Box>
             )}
-          </TableBody>
-        </Table>
+          </Box>
         </Box>
-      </Box>
-    )}
+      )}
 
       <OperacaoModal
         open={operacaoModalOpen}

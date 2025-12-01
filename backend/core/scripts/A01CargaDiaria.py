@@ -16,7 +16,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 import django
 django.setup()
 
-from cotacoes.models import Acao, Cotacao
+from core.models import Acao, Cotacao
 
 def get_dia_util(offset=0):
     hoje = pd.Timestamp.today(tz='America/Sao_Paulo').normalize()

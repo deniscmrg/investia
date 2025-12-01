@@ -31,7 +31,9 @@ def gerar_recomendacoes(top_n=30):
 
     qs = Cotacao.objects.filter(
         data__lte=ultima_data,
-        fechamento__lt=models.F('wma602'),
+        # antes: fechamento__lt=models.F("wma602")  → apenas papéis abaixo da WMA602
+        # agora: considerar todos, garantindo apenas que wma602 não seja nula
+        wma602__isnull=False,
         wma17__isnull=False,
         wma34__isnull=False,
         obv__isnull=False,
@@ -39,7 +41,7 @@ def gerar_recomendacoes(top_n=30):
         media_volume_20d__isnull=False,
         fechamento_anterior__isnull=False,
         atr__isnull=False,
-        volume__gt=0
+        volume__gt=0,
     ).values(
         'data', 'acao__ticker', 'fechamento', 'atr', 'wma602', 'wma17', 'wma34',
         'obv', 'rsi_14', 'volume', 'media_volume_20d', 'fechamento_anterior',

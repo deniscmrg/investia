@@ -13,11 +13,11 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 django.setup()
 
 
-from cotacoes.models import Cotacao, Acao
+from core.models import Cotacao, Acao
 
 # ... cabeçalho permanece igual ...
 
-from cotacoes.models import Cotacao, Acao
+from core.models import Cotacao, Acao
 
 def wilder_moving_average(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
